@@ -26,7 +26,15 @@ jobs:
           'dependencies {','    implementation("com.google.mlkit:text-recognition:16.0.0")','    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1")','}']
           open('app/build.gradle.kts','w',encoding='ascii').write('\n'.join(L)+'\n')
           PY
-      - run: cat -A app/build.gradle.kts | head -30
+      - name: Check bundle
+        run: |
+          echo "bundle.txt satir/bayt (beklenen 456 / 21494):"
+          wc -lc bundle.txt
+          echo "marker sayisi (beklenen 13):"
+          grep -c '^=== FILE:' bundle.txt || true
+          echo "acilan dosyalar:"
+          find app -type f | sort
+          test -f app/src/main/AndroidManifest.xml || { echo "HATA: AndroidManifest.xml yok - bundle.txt eksik yuklenmis"; exit 1; }
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
