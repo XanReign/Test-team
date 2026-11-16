@@ -209,7 +209,7 @@ fun FormationScreen(st: SquadState, onDone: () -> Unit) {
             onValueChange = { t ->
                 targetText = t
                 val v = t.toIntOrNull()
-                if (v != null && v in 1..100) st.setTarget(v)
+                if (v != null && v in 1..100) st.updateTarget(v)
             },
             label = { Text("Hedef reyting (1-100)") }, singleLine = true,
             keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
@@ -533,7 +533,7 @@ class SquadState(ctx: Context) {
         persist()
     }
 
-    fun setTarget(v: Int) { target = v; persist() }
+    fun updateTarget(v: Int) { target = v; persist() }
 
     /** Hata mesajı döner; başarılıysa null. Veri hiçbir zaman otomatik üretilmez. */
     fun put(id: String, p: Pl): String? {
