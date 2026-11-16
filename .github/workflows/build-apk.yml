@@ -1,0 +1,44 @@
+name: Build Native APK
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Unpack bundle2.txt (skip if project files already exist)
+        run: |
+          if [ -f bundle2.txt ]; then
+          python3 - <<'PY'
+          import os,re
+          t=open('bundle2.txt',encoding='utf8').read()
+          parts=re.split(r'^=== FILE: (.+?) ===\r?\n',t,flags=re.M)
+          for i in range(1,len(parts),2):
+              p=parts[i].strip()
+              os.makedirs(os.path.dirname(p) or '.',exist_ok=True)
+              open(p,'w',encoding='utf8',newline='\n').write(parts[i+1].replace('\r\n','\n'))
+          print('unpacked',(len(parts)-1)//2,'files')
+          PY
+          fi
+      - name: Check project
+        run: |
+          find app -type f | sort
+          test -f app/src/main/AndroidManifest.xml || { echo "HATA: proje dosyalari eksik (bundle2.txt tam yuklenmemis olabilir)"; exit 1; }
+          test -f app/src/main/java/app/osmsquad/MainActivity.kt || { echo "HATA: MainActivity.kt yok"; exit 1; }
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.7'
+      - name: Generate Gradle wrapper (jar repoda yok)
+        run: gradle wrapper --gradle-version 8.7
+      - run: chmod +x gradlew
+      - run: ./gradlew assembleDebug --no-daemon
+      - uses: actions/upload-artifact@v4
+        with:
+          name: osm-squad-apk
+          path: app/build/outputs/apk/debug/app-debug.apk
