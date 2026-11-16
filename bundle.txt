@@ -1,1 +1,456 @@
-github.com/XanReign/Test-team/edit/main/bundle.txt
+=== FILE: build.gradle.kts ===
+plugins {
+    id("com.android.application") version "8.5.2" apply false
+    id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+}
+=== FILE: gradle.properties ===
+org.gradle.jvmargs=-Xmx2g
+android.useAndroidX=true
+kotlin.code.style=official
+=== FILE: settings.gradle.kts ===
+pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
+dependencyResolutionManagement {
+    repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+    repositories { google(); mavenCentral() }
+}
+rootProject.name = "OsmAutoSquad"
+include(":app")
+=== FILE: app/build.gradle.kts ===
+plugins {
+    id("com.android.application")
+    id("org.jetbrains.kotlin.android")
+}
+android {
+    namespace = "app.osmautosquad"
+    compileSdk = 34
+    defaultConfig {
+        applicationId = "app.osmautosquad"
+        minSdk = 30            // AccessibilityService.takeScreenshot gerektirir (Android 11+)
+        targetSdk = 34
+        versionCode = 1
+        versionName = "0.1-stage1-3"
+    }
+    compileOptions {
+        sourceCompatibility = JavaVersion.VERSION_17
+        targetCompatibility = JavaVersion.VERSION_17
+    }
+    kotlinOptions { jvmTarget = "17" }
+}
+dependencies {
+    implementation("com.google.mlkit:text-recognition:16.0.0")   // cihaz üstü OCR, internet gerekmez
+    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1")
+}
+=== FILE: app/src/main/AndroidManifest.xml ===
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <application android:label="OSM Auto Squad" android:theme="@android:style/Theme.Material.Light">
+        <activity android:name=".MainActivity" android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN"/>
+                <category android:name="android.intent.category.LAUNCHER"/>
+            </intent-filter>
+        </activity>
+        <service android:name=".OsmService" android:exported="false"
+            android:label="OSM Auto Squad"
+            android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
+            <intent-filter><action android:name="android.accessibilityservice.AccessibilityService"/></intent-filter>
+            <meta-data android:name="android.accessibilityservice" android:resource="@xml/accessibility_config"/>
+        </service>
+    </application>
+</manifest>
+=== FILE: app/src/main/java/app/osmautosquad/MainActivity.kt ===
+package app.osmautosquad
+
+import android.app.Activity
+import android.content.ClipboardManager
+import android.content.Context
+import android.content.Intent
+import android.os.Bundle
+import android.provider.Settings
+import android.view.Gravity
+import android.widget.*
+
+class MainActivity : Activity() {
+    override fun onCreate(b: Bundle?) {
+        super.onCreate(b)
+        val prefs = getSharedPreferences("osm", Context.MODE_PRIVATE)
+        val l = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(24, 24, 24, 24) }
+        val status = TextView(this)
+        val et = EditText(this).apply { hint = "Kadro JSON'unu buraya yapıştır"; minLines = 5; gravity = Gravity.TOP }
+        fun refresh() {
+            val on = Settings.Secure.getString(contentResolver, Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES)?.contains(packageName) == true
+            val sq = prefs.getString("squad", null)?.let { runCatching { SquadIO.parse(it) }.getOrNull() }
+            status.text = "Erişilebilirlik servisi: ${if (on) "AÇIK" else "KAPALI"}\n" +
+                "Kadro: ${sq?.let { "${it.formation} · hedef ${it.target} · ${it.players.size} oyuncu" } ?: "yok"}\n\n" +
+                "Bu uygulamanın izinleri (hepsi senin açtığın erişilebilirlik servisi üzerinden):\n" +
+                "• Ekran görüntüsü alma (OCR için, cihazda kalır)\n• Dokunuş gönderme (yalnızca sen BAŞLAT'a basınca)\n" +
+                "• Yalnızca ${prefs.getString("pkg", "com.gamebasics.osm")} ön plandayken çalışır\n• İnternet izni YOK; parola/hesap okunmaz."
+        }
+        fun btn(t: String, f: () -> Unit) { l.addView(Button(this).apply { text = t; setOnClickListener { f() } }) }
+        l.addView(status); l.addView(et)
+        btn("Panodan yapıştır") {
+            val cm = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+            et.setText(cm.primaryClip?.getItemAt(0)?.text ?: "")
+        }
+        btn("Doğrula ve kaydet") {
+            try {
+                val s = SquadIO.parse(et.text.toString())
+                prefs.edit().putString("squad", et.text.toString()).putString("done", "[]").apply()
+                Toast.makeText(this, "Kaydedildi: ${s.players.size} oyuncu", Toast.LENGTH_LONG).show()
+            } catch (e: Exception) { Toast.makeText(this, "Geçersiz: ${e.message}", Toast.LENGTH_LONG).show() }
+            refresh()
+        }
+        btn("Erişilebilirlik ayarlarını aç") { startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)) }
+        btn("İlerlemeyi sıfırla") { prefs.edit().putString("done", "[]").apply(); refresh() }
+        setContentView(ScrollView(this).apply { addView(l) })
+        refresh()
+    }
+}
+=== FILE: app/src/main/java/app/osmautosquad/Matcher.kt ===
+package app.osmautosquad
+
+import java.text.Normalizer
+
+/** Oyuncuyu yalnızca adla değil; ad + yaş + pozisyon + reyting ile eşleştirir. */
+object Matcher {
+    private val MARKS = Regex("\\p{M}")
+    private val NONLET = Regex("[^a-z]")
+
+    fun n(s: String): String = Normalizer.normalize(s.replace('ı', 'i').replace('İ', 'I'), Normalizer.Form.NFD)
+        .replace(MARKS, "").lowercase().replace(NONLET, "")
+
+    fun lev(a: String, b: String): Int {
+        val d = IntArray(b.length + 1) { it }
+        for (i in 1..a.length) {
+            var p = d[0]; d[0] = i
+            for (j in 1..b.length) {
+                val t = d[j]
+                d[j] = minOf(d[j] + 1, d[j - 1] + 1, p + if (a[i - 1] == b[j - 1]) 0 else 1)
+                p = t
+            }
+        }
+        return d[b.length]
+    }
+
+    fun nameOk(a: String, b: String): Boolean {
+        val x = n(a); val y = n(b)
+        if (x.isEmpty() || y.isEmpty()) return false
+        return x == y || (minOf(x.length, y.length) >= 6 && lev(x, y) <= 1)
+    }
+
+    private fun col(c: String, r: Row): Int? = when (c) { "h" -> r.h; "d" -> r.d; "o" -> r.o; else -> null }
+
+    /** Kaleci (col "k") reytingi listede görünmediği için reyting karşılaştırması atlanır. */
+    fun match(t: Pl, rows: List<Row>): List<Row> = rows.filter { r ->
+        nameOk(t.name, r.name) && r.age == t.age && r.pos == t.pos &&
+            (col(t.col, r)?.let { it == t.rating } ?: true)
+    }
+}
+=== FILE: app/src/main/java/app/osmautosquad/Model.kt ===
+package app.osmautosquad
+
+import org.json.JSONObject
+
+data class Pl(
+    val role: String, val slot: String, val order: Int, val name: String, val age: Int,
+    val club: String, val pos: String, val rating: Int, val col: String, val priority: Boolean
+) {
+    val key: String get() = "$order|$name|$age"
+}
+
+data class Squad(val formation: String, val target: Int, val players: List<Pl>)
+
+object SquadIO {
+    fun parse(json: String): Squad {
+        val o = JSONObject(json)
+        require(o.optInt("version") == 1) { "Desteklenmeyen JSON sürümü" }
+        val arr = o.getJSONArray("players")
+        val list = (0 until arr.length()).map { i ->
+            val q = arr.getJSONObject(i)
+            Pl(q.getString("role"), q.getString("slot"), q.getInt("order"), q.getString("name"),
+                q.getInt("age"), q.optString("club", ""), q.getString("pos"), q.getInt("rating"),
+                q.getString("col"), q.optBoolean("priority", false))
+        }
+        val s = Squad(o.getString("formation"), o.getInt("target"), list)
+        validate(s)
+        return s
+    }
+
+    /** Web uygulamasındaki kurallarla aynı; otomasyon başlamadan önce çalışır. */
+    fun validate(s: Squad) {
+        require(s.players.size == 20) { "Toplam oyuncu 20 olmalı (${s.players.size})" }
+        require(s.players.count { it.role == "XI" } == 11) { "İlk 11 sayısı 11 olmalı" }
+        require(s.players.count { it.role == "SUB" } == 9) { "Yedek sayısı 9 olmalı" }
+        require(s.players.map { it.key }.toSet().size == 20) { "Çift oyuncu var" }
+        require(s.target in 1..100) { "Hedef reyting 1-100 olmalı" }
+        s.players.filter { it.role == "XI" }.forEach {
+            require(it.rating == s.target) { "${it.name}: ilk 11 reytingi hedefle aynı değil" }
+        }
+        val os = s.players.filter { it.role == "XI" && it.pos == "OS" }
+        if (os.size == 2) {
+            require(os.count { it.age in 20..29 } == 1 && os.count { it.age >= 31 } == 1) { "OS yaş kuralı sağlanmıyor" }
+        }
+        require(s.players.none { it.role == "SUB" && it.pos == "SĞA" && it.rating == s.target }) {
+            "Hedef reytingli SĞA yedekte olamaz"
+        }
+    }
+}
+=== FILE: app/src/main/java/app/osmautosquad/Ocr.kt ===
+package app.osmautosquad
+
+import android.graphics.Bitmap
+import android.graphics.Rect
+import com.google.mlkit.vision.common.InputImage
+import com.google.mlkit.vision.text.TextRecognition
+import com.google.mlkit.vision.text.latin.TextRecognizerOptions
+import kotlinx.coroutines.suspendCancellableCoroutine
+import kotlin.coroutines.resume
+
+data class Ln(val text: String, val box: Rect)
+data class TRow(val text: String, val y: Int)
+
+object Ocr {
+    private val rec by lazy { TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS) }
+    private val CNT = Regex("""(\d{1,2})\s*/\s*20""")
+
+    suspend fun lines(b: Bitmap): List<Ln>? = suspendCancellableCoroutine<List<Ln>?> { c ->
+        rec.process(InputImage.fromBitmap(b, 0))
+            .addOnSuccessListener { r ->
+                c.resume(r.textBlocks.flatMap { it.lines }.mapNotNull { l -> l.boundingBox?.let { Ln(l.text, it) } })
+            }
+            .addOnFailureListener { c.resume(null) }
+    }
+
+    /** Aynı yatay hizadaki hücreleri tek satırda birleştirir. */
+    fun rows(ls: List<Ln>): List<TRow> {
+        if (ls.isEmpty()) return emptyList()
+        val sorted = ls.sortedBy { it.box.centerY() }
+        val tol = (sorted.map { it.box.height() }.sorted()[sorted.size / 2] * 0.6).toInt().coerceAtLeast(6)
+        val groups = mutableListOf<MutableList<Ln>>()
+        for (l in sorted) {
+            val g = groups.lastOrNull()
+            if (g != null && Math.abs(l.box.centerY() - g.map { it.box.centerY() }.average()) < tol) g.add(l)
+            else groups.add(mutableListOf(l))
+        }
+        return groups.map { g ->
+            TRow(g.sortedBy { it.box.left }.joinToString(" ") { it.text }, g.map { it.box.centerY() }.average().toInt())
+        }
+    }
+
+    /** Üst çubuktaki "n / 20" sayacı; seçimlerin doğrulanması bununla yapılır. */
+    fun counter(ls: List<Ln>, h: Int): Int? {
+        val top = ls.filter { it.box.centerY() < h * 0.15 }.sortedBy { it.box.left }.joinToString(" ") { it.text }
+        return CNT.find(top)?.groupValues?.get(1)?.toInt()
+    }
+
+    fun isList(ls: List<Ln>): Boolean {
+        val t = ls.joinToString(" ") { it.text }
+        return t.contains("Fiyat") && t.contains("Oyuncu")
+    }
+}
+=== FILE: app/src/main/java/app/osmautosquad/OsmService.kt ===
+package app.osmautosquad
+
+import android.accessibilityservice.AccessibilityService
+import android.accessibilityservice.GestureDescription
+import android.content.Context
+import android.graphics.Bitmap
+import android.graphics.Path
+import android.graphics.PixelFormat
+import android.view.Display
+import android.view.Gravity
+import android.view.View
+import android.view.WindowManager
+import android.view.accessibility.AccessibilityEvent
+import android.widget.Button
+import android.widget.LinearLayout
+import android.widget.TextView
+import kotlinx.coroutines.*
+import org.json.JSONArray
+import kotlin.coroutines.resume
+
+private data class Cap(val lines: List<Ln>, val w: Int, val h: Int)
+
+/**
+ * AŞAMA 1-3: oyuncu listesini oku, oyuncuyu eşleştir, "+" bas, sayaçla doğrula.
+ * Saha yerleşimi (AŞAMA 4) ve yedek akışı için OSM'de oyuncu eklendikten sonraki ekranlar gerekir; henüz yok.
+ */
+class OsmService : AccessibilityService() {
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
+    private var job: Job? = null
+    private var wm: WindowManager? = null
+    private var panel: LinearLayout? = null
+    private lateinit var info: TextView
+    private lateinit var prog: TextView
+    private var squad: Squad? = null
+    private val done = linkedSetOf<String>()
+    private var lastShot = 0L
+    private var current = ""
+
+    private val prefs get() = getSharedPreferences("osm", Context.MODE_PRIVATE)
+    private val targetPkg get() = prefs.getString("pkg", "com.gamebasics.osm") ?: "com.gamebasics.osm"
+    private val plusX get() = prefs.getFloat("plusX", 0.924f)   // "+" düğmesinin ekran genişliğine oranı (kalibrasyon yedeği)
+
+    override fun onAccessibilityEvent(e: AccessibilityEvent?) {}
+    override fun onInterrupt() { stop() }
+    override fun onDestroy() { scope.cancel(); panel?.let { wm?.removeView(it) }; super.onDestroy() }
+
+    override fun onServiceConnected() {
+        super.onServiceConnected()
+        wm = getSystemService(Context.WINDOW_SERVICE) as WindowManager
+        val p = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setBackgroundColor(0xE6102040.toInt()); setPadding(16, 12, 16, 12) }
+        info = TextView(this).apply { setTextColor(-1); textSize = 12f }
+        prog = TextView(this).apply { setTextColor(-1); textSize = 14f }
+        val row = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        fun b(t: String, f: () -> Unit) { row.addView(Button(this).apply { text = t; textSize = 10f; setOnClickListener { f() } }) }
+        b("BAŞLAT") { start() }
+        b("DURAKLAT") { pause("Kullanıcı duraklattı") }
+        b("DEVAM") { start() }
+        b("DURDUR") { stop() }
+        p.addView(info); p.addView(prog); p.addView(row)
+        val lp = WindowManager.LayoutParams(
+            WindowManager.LayoutParams.WRAP_CONTENT, WindowManager.LayoutParams.WRAP_CONTENT,
+            WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY, WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,
+            PixelFormat.TRANSLUCENT).apply { gravity = Gravity.TOP or Gravity.START; y = 80 }
+        wm!!.addView(p, lp); panel = p
+        load(); render("Hazır. OSM'de oyuncu listesini aç, sonra BAŞLAT.")
+    }
+
+    private fun load() {
+        squad = prefs.getString("squad", null)?.let { runCatching { SquadIO.parse(it) }.getOrNull() }
+        done.clear()
+        val a = JSONArray(prefs.getString("done", "[]"))
+        for (i in 0 until a.length()) done.add(a.getString(i))
+    }
+    private fun save() { prefs.edit().putString("done", JSONArray(done.toList()).toString()).apply() }
+
+    private fun render(msg: String) {
+        val s = squad
+        info.text = (if (s != null) "${s.formation} · hedef ${s.target}" else "Kadro yok") +
+            (if (current.isNotEmpty()) "\nŞu an: $current" else "") + "\n$msg"
+        prog.text = "${done.size}/20"
+    }
+
+    private fun start() {
+        load()
+        if (squad == null) { render("Önce uygulamada kadro JSON'unu kaydet."); return }
+        if (job?.isActive == true) return
+        job = scope.launch { runAll() }
+    }
+    private fun pause(why: String) { job?.cancel(); render("DURAKLADI: $why") }
+    private fun stop() { job?.cancel(); current = ""; render("Durduruldu. İlerleme saklandı.") }
+    private fun fail(msg: String): Boolean { pause(msg); return false }
+
+    private suspend fun runAll() {
+        val s = squad ?: return
+        for (p in s.players) {
+            if (p.key in done) continue
+            current = "${p.name} (${p.slot} · ${p.pos})"
+            render("Aranıyor…")
+            if (!step(p)) return
+        }
+        current = ""
+        val c = capture()
+        val n = c?.let { Ocr.counter(it.lines, it.h) }
+        render(if (n == 20) "Sayaç 20/20 doğrulandı. (Saha yerleşimi bu sürümde otomatik DEĞİL.)"
+               else "Tüm oyuncular işlendi ama sayaç 20 okunamadı/doğrulanamadı ($n).")
+    }
+
+    private suspend fun step(p: Pl): Boolean {
+        var scrolls = 0; var lastSig = ""
+        while (true) {
+            currentCoroutineContext().ensureActive()
+            val cap = capture() ?: return fail("Ekran görüntüsü/OCR alınamadı")
+            if (rootInActiveWindow?.packageName?.toString() != targetPkg) return fail("OSM ön planda değil (beklenen: $targetPkg)")
+            if (!Ocr.isList(cap.lines)) return fail("Oyuncu listesi ekranı tanınmadı")
+            val before = Ocr.counter(cap.lines, cap.h) ?: return fail("n/20 sayacı okunamadı")
+            if (before >= 20) return fail("Sayaç zaten 20/20")
+            val rows = Ocr.rows(cap.lines).mapNotNull { r -> Parser.row(r.text, r.y) }
+            val m = Matcher.match(p, rows)
+            if (m.size > 1) return fail("Belirsiz eşleşme: ${p.name}")
+            if (m.size == 1) {
+                if (!gesture(Path().apply { moveTo(cap.w * plusX, m[0].y.toFloat()) }, 60)) return fail("Dokunuş gönderilemedi")
+                delay(900)
+                val c2 = capture() ?: return fail("Doğrulama görüntüsü alınamadı")
+                val after = Ocr.counter(c2.lines, c2.h)
+                if (after == before + 1) { done.add(p.key); save(); render("✔ eklendi"); return true }
+                return fail("Seçim doğrulanamadı (sayaç $before→$after): ${p.name}")
+            }
+            val sig = rows.joinToString { it.name }
+            if (sig == lastSig || ++scrolls > 40) return fail("Listede bulunamadı: ${p.name}")
+            lastSig = sig
+            gesture(Path().apply { moveTo(cap.w * 0.5f, cap.h * 0.8f); lineTo(cap.w * 0.5f, cap.h * 0.4f) }, 450)
+            delay(700)
+        }
+    }
+
+    private suspend fun gesture(path: Path, dur: Long): Boolean = suspendCancellableCoroutine<Boolean> { c ->
+        val g = GestureDescription.Builder().addStroke(GestureDescription.StrokeDescription(path, 0, dur)).build()
+        val ok = dispatchGesture(g, object : AccessibilityService.GestureResultCallback() {
+            override fun onCompleted(d: GestureDescription?) { c.resume(true) }
+            override fun onCancelled(d: GestureDescription?) { c.resume(false) }
+        }, null)
+        if (!ok) c.resume(false)
+    }
+
+    private suspend fun capture(): Cap? {
+        val wait = 1200 - (System.currentTimeMillis() - lastShot)
+        if (wait > 0) delay(wait)
+        panel?.visibility = View.INVISIBLE        // panel metni OCR'ı bozmasın
+        delay(200)
+        val bmp: Bitmap? = try {
+            suspendCancellableCoroutine<Bitmap?> { c ->
+                takeScreenshot(Display.DEFAULT_DISPLAY, mainExecutor, object : AccessibilityService.TakeScreenshotCallback {
+                    override fun onSuccess(r: AccessibilityService.ScreenshotResult) {
+                        val hb = r.hardwareBuffer
+                        val b = Bitmap.wrapHardwareBuffer(hb, r.colorSpace)?.copy(Bitmap.Config.ARGB_8888, false)
+                        hb.close(); c.resume(b)
+                    }
+                    override fun onFailure(code: Int) { c.resume(null) }
+                })
+            }
+        } finally { panel?.visibility = View.VISIBLE; lastShot = System.currentTimeMillis() }
+        if (bmp == null) return null
+        val ls = Ocr.lines(bmp) ?: return null
+        return Cap(ls, bmp.width, bmp.height)
+    }
+}
+=== FILE: app/src/main/java/app/osmautosquad/Parser.kt ===
+package app.osmautosquad
+
+import java.util.Locale
+
+data class Row(val name: String, val age: Int, val club: String, val pos: String,
+               val h: Int, val d: Int, val o: Int, val y: Int = 0)
+
+/** Web uygulamasındaki OCR ayrıştırıcının (parseOCR) Kotlin karşılığı; tek bir satır metnini çözer. */
+object Parser {
+    private val RX = Regex("""([^\d()]+?)\s*\((\d{1,2})\)\s*([^()]+?)\s+([A-ZĞÖÜİŞÇ0]{1,3})\s+(\d{1,3})\s+(\d{1,3})\s+(\d{1,3})""")
+    private val LEAD = Regex("^[^A-Za-zÀ-ÿĞğİıŞşÇçÖöÜü]+")
+    private val WS = Regex("\\s+")
+
+    fun pos(t: String): String = t.uppercase(Locale("tr")).replace('0', 'O')
+        .replace("SGA", "SĞA").replace("SGK", "SĞK").replace("SGB", "SĞB")
+
+    fun row(text: String, y: Int): Row? {
+        val m = RX.find(text) ?: return null
+        val g = m.groupValues
+        val name = g[1].replace(LEAD, "").replace(WS, " ").trim()
+        return Row(name, g[2].toInt(), g[3].replace(WS, " ").trim(), pos(g[4]),
+            g[5].toInt(), g[6].toInt(), g[7].toInt(), y)
+    }
+}
+=== FILE: app/src/main/res/values/strings.xml ===
+<resources>
+    <string name="service_desc">Yalnızca sen başlatınca, OSM oyuncu listesinde ekran görüntüsü okuyup dokunuş gönderir. Parola veya hesap bilgisi okumaz.</string>
+</resources>
+=== FILE: app/src/main/res/xml/accessibility_config.xml ===
+<?xml version="1.0" encoding="utf-8"?>
+<accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
+    android:accessibilityEventTypes="typeWindowStateChanged"
+    android:accessibilityFeedbackType="feedbackGeneric"
+    android:accessibilityFlags="flagDefault"
+    android:canPerformGestures="true"
+    android:canTakeScreenshot="true"
+    android:notificationTimeout="200"
+    android:description="@string/service_desc"/>
