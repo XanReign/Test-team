@@ -102,6 +102,9 @@ class MainActivity : Activity() {
         }
         btn("Erişilebilirlik ayarlarını aç") { startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)) }
         btn("İlerlemeyi sıfırla") { prefs.edit().putString("done", "[]").apply(); refresh() }
+        val pk = EditText(this).apply { setText(prefs.getString("pkg", "com.gamebasics.osm")) }
+        l.addView(TextView(this).apply { text = "OSM paket adı (görülen paket adı farklıysa düzelt):" }); l.addView(pk)
+        btn("Paket adını kaydet") { prefs.edit().putString("pkg", pk.text.toString().trim()).apply(); refresh() }
         setContentView(ScrollView(this).apply { addView(l) })
         refresh()
     }
@@ -291,7 +294,16 @@ class OsmService : AccessibilityService() {
     private val targetPkg get() = prefs.getString("pkg", "com.gamebasics.osm") ?: "com.gamebasics.osm"
     private val plusX get() = prefs.getFloat("plusX", 0.924f)   // "+" düğmesinin ekran genişliğine oranı (kalibrasyon yedeği)
 
-    override fun onAccessibilityEvent(e: AccessibilityEvent?) {}
+    private var evPkg: String? = null
+    override fun onAccessibilityEvent(e: AccessibilityEvent?) {
+        val p = e?.packageName?.toString() ?: return
+        if (p != packageName && !p.startsWith("com.android.systemui") && !p.contains("inputmethod") && !p.contains("keyboard")) evPkg = p
+    }
+    /** Ön plandaki uygulama: önce aktif pencere, olmazsa son pencere olayı. */
+    private fun fgPkg(): String? {
+        val r = rootInActiveWindow?.packageName?.toString()
+        return if (r != null && r != packageName) r else evPkg
+    }
     override fun onInterrupt() { stop() }
     override fun onDestroy() { scope.cancel(); panel?.let { wm?.removeView(it) }; super.onDestroy() }
 
@@ -361,7 +373,7 @@ class OsmService : AccessibilityService() {
         while (true) {
             currentCoroutineContext().ensureActive()
             val cap = capture() ?: return fail("Ekran görüntüsü/OCR alınamadı")
-            if (rootInActiveWindow?.packageName?.toString() != targetPkg) return fail("OSM ön planda değil (beklenen: $targetPkg)")
+            if (fgPkg() != targetPkg) return fail("OSM ön planda değil (görülen: ${fgPkg()}, beklenen: $targetPkg)")
             if (!Ocr.isList(cap.lines)) return fail("Oyuncu listesi ekranı tanınmadı")
             val before = Ocr.counter(cap.lines, cap.h) ?: return fail("n/20 sayacı okunamadı")
             if (before >= 20) return fail("Sayaç zaten 20/20")
@@ -452,5 +464,6 @@ object Parser {
     android:accessibilityFlags="flagDefault"
     android:canPerformGestures="true"
     android:canTakeScreenshot="true"
+    android:canRetrieveWindowContent="true"
     android:notificationTimeout="200"
     android:description="@string/service_desc"/>
