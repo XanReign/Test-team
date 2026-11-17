@@ -1,8 +1,8 @@
 # OSM Auto Squad — Android native
 
-This project combines the Compose roster editor from `bundle2.txt` with the OCR / AccessibilityService foundation from `bundle.txt`.
+This project combines the Compose roster editor with the OCR / AccessibilityService foundation. Current app version: 0.4.0.
 
-## Included in this revision
+## Included in v0.4.0
 
 - Native Android application using Kotlin, Jetpack Compose, ML Kit OCR and AccessibilityService.
 - Formation editor for 4-3-3A and 5-2-3A.
