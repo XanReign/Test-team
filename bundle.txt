@@ -105,6 +105,14 @@ class MainActivity : Activity() {
         val pk = EditText(this).apply { setText(prefs.getString("pkg", "com.gamebasics.osm")) }
         l.addView(TextView(this).apply { text = "OSM paket adı (görülen paket adı farklıysa düzelt):" }); l.addView(pk)
         btn("Paket adını kaydet") { prefs.edit().putString("pkg", pk.text.toString().trim()).apply(); refresh() }
+        val wt = EditText(this).apply { setText(prefs.getLong("waitMs", 900L).toString()); inputType = android.text.InputType.TYPE_CLASS_NUMBER }
+        val rt = EditText(this).apply { setText(prefs.getInt("retries", 2).toString()); inputType = android.text.InputType.TYPE_CLASS_NUMBER }
+        l.addView(TextView(this).apply { text = "Bekleme süresi (ms, 300-5000) ve yeniden deneme sayısı (0-5):" }); l.addView(wt); l.addView(rt)
+        btn("Ayarları kaydet") {
+            prefs.edit().putLong("waitMs", wt.text.toString().toLongOrNull()?.coerceIn(300L, 5000L) ?: 900L)
+                .putInt("retries", rt.text.toString().toIntOrNull()?.coerceIn(0, 5) ?: 2).apply()
+            Toast.makeText(this, "Kaydedildi", Toast.LENGTH_SHORT).show()
+        }
         setContentView(ScrollView(this).apply { addView(l) })
         refresh()
     }
@@ -144,8 +152,10 @@ object Matcher {
     private fun col(c: String, r: Row): Int? = when (c) { "h" -> r.h; "d" -> r.d; "o" -> r.o; else -> null }
 
     /** Kaleci (col "k") reytingi listede görünmediği için reyting karşılaştırması atlanır. */
+    private fun canon(p: String) = if (p == "KLC") "KL" else p
+
     fun match(t: Pl, rows: List<Row>): List<Row> = rows.filter { r ->
-        nameOk(t.name, r.name) && r.age == t.age && r.pos == t.pos &&
+        nameOk(t.name, r.name) && (t.age == 0 || r.age == t.age) && canon(r.pos) == canon(t.pos) &&
             (col(t.col, r)?.let { it == t.rating } ?: true)
     }
 }
@@ -188,6 +198,14 @@ object SquadIO {
         require(s.target in 1..100) { "Hedef reyting 1-100 olmalı" }
         s.players.filter { it.role == "XI" }.forEach {
             require(it.rating == s.target) { "${it.name}: ilk 11 reytingi hedefle aynı değil" }
+        }
+        val grp = { pos: String ->
+            when (pos) { "KL", "KLC" -> "GK"; "SLB", "STP", "SĞB" -> "DF"; "SF", "SLA", "SĞA" -> "FW"; else -> "MD" }
+        }
+        val subs = s.players.filter { it.role == "SUB" }
+        require(subs.count { grp(it.pos) == "GK" } == 2 && subs.count { grp(it.pos) == "DF" } == 3 &&
+            subs.count { grp(it.pos) == "MD" } == 2 && subs.count { grp(it.pos) == "FW" } == 2) {
+            "Yedek dağılımı 2 KL, 3 DEF, 2 ORT, 2 FOR olmalı"
         }
         val os = s.players.filter { it.role == "XI" && it.pos == "OS" }
         if (os.size == 2) {
@@ -256,7 +274,10 @@ package app.osmautosquad
 
 import android.accessibilityservice.AccessibilityService
 import android.accessibilityservice.GestureDescription
+import android.content.ClipData
+import android.content.ClipboardManager
 import android.content.Context
+import android.os.Bundle
 import android.graphics.Bitmap
 import android.graphics.Path
 import android.graphics.PixelFormat
@@ -265,6 +286,8 @@ import android.view.Gravity
 import android.view.View
 import android.view.WindowManager
 import android.view.accessibility.AccessibilityEvent
+import android.view.accessibility.AccessibilityNodeInfo
+import android.view.accessibility.AccessibilityWindowInfo
 import android.widget.Button
 import android.widget.LinearLayout
 import android.widget.TextView
@@ -292,6 +315,8 @@ class OsmService : AccessibilityService() {
 
     private val prefs get() = getSharedPreferences("osm", Context.MODE_PRIVATE)
     private val targetPkg get() = prefs.getString("pkg", "com.gamebasics.osm") ?: "com.gamebasics.osm"
+    private val waitMs get() = prefs.getLong("waitMs", 900L)
+    private val retries get() = prefs.getInt("retries", 2)
     private val plusX get() = prefs.getFloat("plusX", 0.924f)   // "+" düğmesinin ekran genişliğine oranı (kalibrasyon yedeği)
 
     private var evPkg: String? = null
@@ -319,7 +344,9 @@ class OsmService : AccessibilityService() {
         b("DURAKLAT") { pause("Kullanıcı duraklattı") }
         b("DEVAM") { start() }
         b("DURDUR") { stop() }
-        p.addView(info); p.addView(prog); p.addView(row)
+        val row2 = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        row2.addView(Button(this).apply { text = "TANI"; textSize = 10f; setOnClickListener { diagnose() } })
+        p.addView(info); p.addView(prog); p.addView(row); p.addView(row2)
         val lp = WindowManager.LayoutParams(
             WindowManager.LayoutParams.WRAP_CONTENT, WindowManager.LayoutParams.WRAP_CONTENT,
             WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY, WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,
@@ -369,7 +396,13 @@ class OsmService : AccessibilityService() {
     }
 
     private suspend fun step(p: Pl): Boolean {
-        var scrolls = 0; var lastSig = ""
+        var scrolls = 0; var lastSig = ""; var searchTries = 0; var typed = false
+        if (findEditable() != null) {
+            render("Yazılıyor: ${p.name}")
+            if (!typeName(p.name)) return fail("Arama kutusuna yazılamadı/doğrulanamadı: ${p.name}")
+            typed = true
+            delay(waitMs)
+        }
         while (true) {
             currentCoroutineContext().ensureActive()
             val cap = capture() ?: return fail("Ekran görüntüsü/OCR alınamadı")
@@ -385,15 +418,86 @@ class OsmService : AccessibilityService() {
                 delay(900)
                 val c2 = capture() ?: return fail("Doğrulama görüntüsü alınamadı")
                 val after = Ocr.counter(c2.lines, c2.h)
-                if (after == before + 1) { done.add(p.key); save(); render("✔ eklendi"); return true }
+                if (after == before + 1) { done.add(p.key); save(); render("✔ eklendi"); if (typed) clearSearch(); return true }
                 return fail("Seçim doğrulanamadı (sayaç $before→$after): ${p.name}")
             }
+            if (typed && searchTries < retries) { searchTries++; delay(waitMs); continue }
             val sig = rows.joinToString { it.name }
             if (sig == lastSig || ++scrolls > 40) return fail("Listede bulunamadı: ${p.name}")
             lastSig = sig
             gesture(Path().apply { moveTo(cap.w * 0.5f, cap.h * 0.8f); lineTo(cap.w * 0.5f, cap.h * 0.4f) }, 450)
             delay(700)
         }
+    }
+
+    private fun findEditable(): AccessibilityNodeInfo? {
+        val root = rootInActiveWindow ?: return null
+        var found: AccessibilityNodeInfo? = null
+        fun walk(n: AccessibilityNodeInfo?) {
+            if (n == null || found != null) return
+            if (n.isVisibleToUser && (n.isEditable || n.className?.toString()?.contains("EditText") == true)) { found = n; return }
+            for (i in 0 until n.childCount) walk(n.getChild(i))
+        }
+        walk(root)
+        return found
+    }
+
+    /** Arama kutusuna yazar ve metnin gerçekten yazıldığını okuyarak doğrular. */
+    private suspend fun typeName(name: String): Boolean {
+        for (attempt in 0..retries) {
+            val n = findEditable()
+            if (n != null) {
+                n.performAction(AccessibilityNodeInfo.ACTION_FOCUS)
+                n.performAction(AccessibilityNodeInfo.ACTION_CLICK)
+                delay(300)
+                val args = Bundle()
+                args.putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, name)
+                val ok = n.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args)
+                delay(300)
+                n.refresh()
+                if (ok && n.text?.toString()?.trim().equals(name, ignoreCase = true)) {
+                    n.performAction(AccessibilityNodeInfo.AccessibilityAction.ACTION_IME_ENTER.id)
+                    return true
+                }
+            }
+            delay(waitMs)
+        }
+        return false
+    }
+
+    private fun clearSearch() {
+        val n = findEditable() ?: return
+        val a = Bundle()
+        a.putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, "")
+        n.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, a)
+    }
+
+    private fun kbVisible(): Boolean = windows.any { it.type == AccessibilityWindowInfo.TYPE_INPUT_METHOD }
+
+    /** OSM ekranının erişilebilirlik ağacını inceler; arama kutusu görünüyor mu gösterir. */
+    private fun diagnose() {
+        val root = rootInActiveWindow
+        if (root == null) { render("TANI: aktif pencere okunamadı (kök yok)"); return }
+        var nodes = 0; var edits = 0; var clicks = 0
+        val sb = StringBuilder()
+        fun walk(n: AccessibilityNodeInfo?, d: Int) {
+            if (n == null || nodes > 3000) return
+            nodes++
+            val ed = n.isEditable || n.className?.toString()?.contains("EditText") == true
+            if (ed) edits++
+            if (n.isClickable) clicks++
+            val t = n.text?.toString() ?: n.contentDescription?.toString()
+            if ((ed || t != null) && sb.length < 4000) {
+                sb.append("  ".repeat(d.coerceAtMost(10))).append(n.className?.toString()?.substringAfterLast('.'))
+                    .append(if (ed) " [DUZENLENEBILIR]" else "").append(": ").append(t ?: "").append("\n")
+            }
+            for (i in 0 until n.childCount) walk(n.getChild(i), d + 1)
+        }
+        walk(root, 0)
+        val head = "pkg=${root.packageName} dugum=$nodes duzenlenebilir=$edits tiklanabilir=$clicks klavye=${kbVisible()}"
+        val cm = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+        cm.setPrimaryClip(ClipData.newPlainText("tani", head + "\n" + sb))
+        render("TANI: $head\n(ayrıntı panoya kopyalandı)")
     }
 
     private suspend fun gesture(path: Path, dur: Long): Boolean = suspendCancellableCoroutine<Boolean> { c ->
@@ -461,7 +565,7 @@ object Parser {
 <accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
     android:accessibilityEventTypes="typeWindowStateChanged"
     android:accessibilityFeedbackType="feedbackGeneric"
-    android:accessibilityFlags="flagDefault"
+    android:accessibilityFlags="flagDefault|flagRetrieveInteractiveWindows"
     android:canPerformGestures="true"
     android:canTakeScreenshot="true"
     android:canRetrieveWindowContent="true"
