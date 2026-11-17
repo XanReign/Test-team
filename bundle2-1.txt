@@ -1,0 +1,1872 @@
+=== FILE: .github/workflows/build-apk.yml ===
+name: Build OSM Auto Squad APK
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+
+permissions:
+  contents: read
+
+env:
+  JAVA_VERSION: '17'
+  GRADLE_VERSION: '8.7'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ env.JAVA_VERSION }}
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: ${{ env.GRADLE_VERSION }}
+
+      - name: Generate Gradle wrapper
+        run: gradle wrapper --gradle-version "$GRADLE_VERSION"
+
+      - name: Build debug APK
+        run: |
+          chmod +x ./gradlew
+          ./gradlew clean assembleDebug --no-daemon --stacktrace
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: osm-auto-squad-debug-apk
+          path: app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
+          retention-days: 14
+
+=== FILE: README.md ===
+# OSM Auto Squad — Android native
+
+This project combines the Compose roster editor with the OCR / AccessibilityService foundation. Current app version: 0.4.0.
+
+## Included in v0.4.0
+
+- Native Android application using Kotlin, Jetpack Compose, ML Kit OCR and AccessibilityService.
+- Formation editor for 4-3-3A and 5-2-3A.
+- Twenty roster places: starting XI plus 9 substitutes.
+- Position selection for substitutes and an “öncelikli yedek” flag.
+- Preflight validation for the roster rules:
+  - XI rating equals the selected target rating.
+  - Starting XI age rule: non-OS positions 20–29; among the two OS players, one is 20–29 and one is 31+.
+  - Priority substitutes: at least target rating and age 20–29.
+  - Standard substitutes: at least 50 rating and age 15–50.
+  - 9 substitute positions: 2 GK, 3 DF, 2 MD, 2 FW.
+  - A target-rated SĞA cannot be a substitute.
+- Automation handoff from the Compose roster to the AccessibilityService.
+- Floating controls: BAŞLAT, DURAKLAT, DEVAM, DURDUR and TANI.
+- After a pitch slot is selected, the service recognizes the category chooser and taps the blue + button inside the matching category row (Forvetler, Orta sahalar, Defanslar or Kaleciler). It does not tap the category heading itself. It then opens the player list/search step.
+- OCR-based player-row matching checks name, age, position and available rating columns; duplicate matches or failed counter verification stop the run.
+- For starting-XI slots, the service attempts to detect the green pitch area and maps the saved formation position into that area. If the pitch cannot be detected, it stops without tapping.
+- For substitute slots, the service only proceeds when the Yedekler tab and the named slot are available through the Android accessibility tree. It does not guess substitute coordinates.
+
+## Build
+
+Push the project to a GitHub repository, then run **Actions → Build OSM Auto Squad APK → Run workflow**. The debug APK is uploaded as the `osm-auto-squad-debug-apk` artifact.
+
+The repository does not include a Gradle wrapper binary. The workflow creates the wrapper using Gradle 8.7 before building.
+
+## Phone setup
+
+1. Install the debug APK.
+2. Open the app and choose 4-3-3A or 5-2-3A.
+3. Enter all 20 players, including age, rating and substitute position/priority status.
+4. Open the Checklist tab and press **Otomasyon için hazırla**. Any roster rule errors must be fixed first.
+5. Enable **OSM Auto Squad** under Android Accessibility settings.
+6. Open OSM and go to the squad / pitch screen. Use the floating service panel and press **BAŞLAT**.
+7. Keep an eye on the first run. Press **DURAKLAT** or **DURDUR** if the game screen looks different or unexpected.
+
+## Known limitations — do not treat as production-verified
+
+- This source revision has not been built on a real Android SDK or tested against the live OSM app UI in this environment. The GitHub Actions workflow is included, but an APK has not been generated here.
+- OSM screen layouts and OCR text vary by app version, language, device and resolution. The pitch-region detection and normalized field points must be validated on the user's actual OSM screen before unattended use.
+- Substitute placement depends on OSM exposing the bench tab and slot labels in the Accessibility tree. If those labels are unavailable, the service stops rather than tapping guessed coordinates.
+- Goalkeeper rating is not independently compared because the older OCR row format did not expose a goalkeeper rating column. Name, age and position are still checked.
+- There is not yet a verified transfer-price / available-budget parser. Do not run unattended with a valuable in-game budget until the budget guard is implemented and verified.
+- Any player row with more than one strict candidate, a missing category, an unreadable counter, or an unverified add is treated as an error and stops the run.
+
+The category + selection fix is based on the supplied OSM screenshot and still needs to be confirmed on the installed OSM version. This is an integrated development build, not a claim that all screen-specific automation is finished or field-tested.
+
+=== FILE: app/build.gradle.kts ===
+plugins {
+    id("com.android.application")
+    id("org.jetbrains.kotlin.android")
+}
+
+android {
+    namespace = "app.osmsquad"
+    compileSdk = 34
+    defaultConfig {
+        applicationId = "app.osmsquad"
+        minSdk = 30
+        targetSdk = 34
+        versionCode = 4
+        versionName = "0.4.0"
+    }
+    buildFeatures { compose = true }
+    composeOptions { kotlinCompilerExtensionVersion = "1.5.14" }
+    compileOptions {
+        sourceCompatibility = JavaVersion.VERSION_17
+        targetCompatibility = JavaVersion.VERSION_17
+    }
+    kotlinOptions { jvmTarget = "17" }
+}
+
+dependencies {
+    implementation(platform("androidx.compose:compose-bom:2024.06.00"))
+    implementation("androidx.compose.material3:material3")
+    implementation("androidx.compose.ui:ui")
+    implementation("androidx.compose.foundation:foundation")
+    implementation("androidx.activity:activity-compose:1.9.0")
+    implementation("com.google.mlkit:text-recognition:16.0.0")
+    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1")
+}
+
+=== FILE: app/src/main/AndroidManifest.xml ===
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <queries>
+        <package android:name="com.gamebasics.osm" />
+        <package android:name="com.pengyou.cloneapp" />
+    </queries>
+    <application
+        android:label="OSM Auto Squad"
+        android:allowBackup="false"
+        android:theme="@android:style/Theme.Material.Light.NoActionBar">
+        <activity
+            android:name=".MainActivity"
+            android:exported="true"
+            android:windowSoftInputMode="adjustResize">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+        <service
+            android:name=".OsmService"
+            android:exported="false"
+            android:label="OSM Auto Squad"
+            android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
+            <intent-filter>
+                <action android:name="android.accessibilityservice.AccessibilityService" />
+            </intent-filter>
+            <meta-data
+                android:name="android.accessibilityservice"
+                android:resource="@xml/accessibility_config" />
+        </service>
+    </application>
+</manifest>
+
+=== FILE: app/src/main/java/app/osmsquad/AutomationModel.kt ===
+package app.osmsquad
+
+import org.json.JSONArray
+import org.json.JSONObject
+
+data class AutoPlayer(
+    val role: String,
+    val slot: String,
+    val order: Int,
+    val name: String,
+    val age: Int,
+    val club: String,
+    val pos: String,
+    val rating: Int,
+    val col: String,
+    val priority: Boolean
+) {
+    val key: String get() = "$order|$name|$age"
+}
+
+data class Squad(val formation: String, val target: Int, val players: List<AutoPlayer>)
+
+object SquadIO {
+    fun parse(json: String): Squad {
+        val o = JSONObject(json)
+        require(o.optInt("version") == 1) { "Otomasyon JSON sürümü desteklenmiyor" }
+        val arr = o.getJSONArray("players")
+        val list = (0 until arr.length()).map { i ->
+            val q = arr.getJSONObject(i)
+            AutoPlayer(q.getString("role"), q.getString("slot"), q.getInt("order"), q.getString("name"),
+                q.getInt("age"), q.optString("club", ""), q.getString("pos"), q.getInt("rating"),
+                q.optString("col", "o"), q.optBoolean("priority", false))
+        }
+        val s = Squad(o.getString("formation"), o.getInt("target"), list)
+        validate(s)
+        return s
+    }
+
+    fun validate(s: Squad) {
+        val formation = Formations.all.firstOrNull { it.id == s.formation }
+            ?: throw IllegalArgumentException("Diziliş geçersiz")
+        require(s.players.size == 20) { "Toplam oyuncu 20 olmalı (${s.players.size})" }
+        require(s.players.count { it.role == "XI" } == 11) { "İlk 11 sayısı 11 olmalı" }
+        require(s.players.count { it.role == "SUB" } == 9) { "Yedek sayısı 9 olmalı" }
+        require(s.players.all { it.role == "XI" || it.role == "SUB" }) { "Oyuncu rolü geçersiz" }
+        require(s.players.map { it.key }.toSet().size == 20) { "Çift oyuncu kaydı var" }
+        require(s.players.map { fold(it.name) }.toSet().size == 20) { "Tekrarlanan oyuncu adı var" }
+        require(s.target in 1..100) { "Hedef reyting 1-100 olmalı" }
+        val xi = s.players.filter { it.role == "XI" }
+        val subs = s.players.filter { it.role == "SUB" }
+        require(xi.map { it.slot }.toSet() == formation.slots.map { it.id }.toSet()) { "İlk 11 yuvaları dizilişle uyuşmuyor" }
+        require(subs.map { it.slot }.toSet() == Formations.SUBS.map { it.id }.toSet()) { "Yedek yuvaları eksik veya tekrarlı" }
+        val xiBySlot = xi.associateBy { it.slot }
+        formation.slots.forEach { slot ->
+            val player = xiBySlot[slot.id] ?: error("Eksik ilk 11 yuvası: ${slot.label}")
+            require(player.pos == slot.label) { "${slot.label} yuvasında yanlış pozisyon: ${player.pos}" }
+        }
+        s.players.forEach { p ->
+            require(p.name.isNotBlank() && p.age in 1..60 && p.rating in 1..100) { "Oyuncu bilgisi geçersiz: ${p.name}" }
+            require(Formations.groupOfPosition(p.pos) != null) { "Pozisyon tanınmadı: ${p.pos}" }
+        }
+        xi.forEach {
+            require(it.rating == s.target) { "${it.name}: ilk 11 reytingi hedef ${s.target} olmalı" }
+            if (it.pos != "OS") require(it.age in 20..29) { "${it.name}: ilk 11 yaşı 20-29 olmalı" }
+        }
+        val os = xi.filter { it.pos == "OS" }
+        require(os.size == 2 && os.count { it.age in 20..29 } == 1 && os.count { it.age >= 31 } == 1) {
+            "İlk 11'deki iki OS oyuncusundan biri 20-29, diğeri 31+ yaşında olmalı"
+        }
+        val subSlotGroup = Formations.SUBS.associate { it.id to it.group }
+        subs.forEach { p ->
+            require(subSlotGroup[p.slot] == Formations.groupOfPosition(p.pos)) { "${p.name}: yedek yuvası/pozisyon grubu uyuşmuyor" }
+            if (p.priority) {
+                require(p.rating >= s.target && p.age in 20..29) { "Öncelikli yedek ${p.name}: hedef reyting ve 20-29 yaş gerekli" }
+            } else {
+                require(p.rating >= 50 && p.age in 15..50) { "Normal yedek ${p.name}: en az 50 reyting ve 15-50 yaş gerekli" }
+            }
+            require(!(p.pos == "SĞA" && p.rating == s.target)) { "Hedef reytingli SĞA yedek olamaz: ${p.name}" }
+        }
+        require(subs.count { Formations.groupOfPosition(it.pos) == "GK" } == 2 &&
+            subs.count { Formations.groupOfPosition(it.pos) == "DF" } == 3 &&
+            subs.count { Formations.groupOfPosition(it.pos) == "MD" } == 2 &&
+            subs.count { Formations.groupOfPosition(it.pos) == "FW" } == 2) {
+            "Yedek dağılımı 2 KL, 3 DEF, 2 ORT, 2 FOR olmalı"
+        }
+    }
+
+    private fun fold(s: String): String = java.text.Normalizer.normalize(s.replace('ı', 'i').replace('İ', 'I'), java.text.Normalizer.Form.NFD)
+        .replace(Regex("\\p{M}"), "").lowercase().replace(Regex("[^a-z0-9]"), "")
+}
+
+=== FILE: app/src/main/java/app/osmsquad/MainActivity.kt ===
+package app.osmsquad
+
+import android.content.ClipData
+import android.content.ClipboardManager
+import android.content.Context
+import android.content.Intent
+import android.net.Uri
+import android.os.Bundle
+import android.provider.Settings
+import android.widget.Toast
+import androidx.activity.ComponentActivity
+import androidx.activity.compose.setContent
+import androidx.compose.foundation.background
+import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.material3.*
+import androidx.compose.runtime.*
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.KeyboardCapitalization
+import androidx.compose.ui.text.input.KeyboardType
+import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+
+class MainActivity : ComponentActivity() {
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        val st = SquadState(applicationContext)
+        setContent {
+            MaterialTheme {
+                Surface(Modifier.fillMaxSize()) { App(st) }
+            }
+        }
+    }
+}
+
+fun copyText(ctx: Context, t: String) {
+    val cm = ctx.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+    cm.setPrimaryClip(ClipData.newPlainText("oyuncu", t))
+    Toast.makeText(ctx, "Kopyalandı: $t", Toast.LENGTH_SHORT).show()
+}
+
+fun openOsm(ctx: Context) {
+    for (pkg in listOf("com.gamebasics.osm", "com.pengyou.cloneapp")) {
+        val i = ctx.packageManager.getLaunchIntentForPackage(pkg)
+        if (i != null) {
+            i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            ctx.startActivity(i)
+            return
+        }
+    }
+    try {
+        val i = Intent(Intent.ACTION_VIEW, Uri.parse("https://play.google.com/store/apps/details?id=com.gamebasics.osm"))
+        i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        ctx.startActivity(i)
+    } catch (e: Exception) {
+        Toast.makeText(ctx, "OSM açılamadı", Toast.LENGTH_SHORT).show()
+    }
+}
+
+@Composable
+fun App(st: SquadState) {
+    var tab by remember { mutableStateOf(0) }
+    var editSlot by remember { mutableStateOf<Slot?>(null) }
+    var pick by remember { mutableStateOf(st.formationId == null) }
+
+    if (pick || st.formation == null) {
+        FormationScreen(st) { pick = false }
+    } else {
+        Scaffold(
+            topBar = { Header(st) },
+            bottomBar = {
+                NavigationBar {
+                    val items = listOf("Saha" to "⚽", "Yedekler" to "🪑", "Liste" to "✅", "JSON" to "💾")
+                    items.forEachIndexed { i, it ->
+                        NavigationBarItem(
+                            selected = tab == i, onClick = { tab = i },
+                            icon = { Text(it.second) }, label = { Text(it.first) }
+                        )
+                    }
+                }
+            }
+        ) { pad ->
+            Box(Modifier.padding(pad)) {
+                when (tab) {
+                    0 -> PitchScreen(st, onPick = { pick = true }, onTap = { editSlot = it })
+                    1 -> SubsScreen(st, onTap = { editSlot = it })
+                    2 -> ChecklistScreen(st, onEdit = { editSlot = it })
+                    else -> JsonScreen(st)
+                }
+            }
+        }
+    }
+    editSlot?.let { s -> PlayerDialog(st, s) { editSlot = null } }
+}
+
+@Composable
+fun Header(st: SquadState) {
+    val n = st.players.size
+    Row(
+        Modifier.fillMaxWidth().background(if (n == 20) Color(0xFF2E7D32) else Color(0xFF0D47A1)).padding(12.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Text("$n/20", color = Color.White, fontSize = 30.sp, fontWeight = FontWeight.Bold)
+        Spacer(Modifier.width(14.dp))
+        Column {
+            Text("Diziliş: ${st.formationId ?: "-"} · hedef reyting ${st.target}", color = Color.White, fontSize = 13.sp)
+            val miss = 20 - n
+            Text(if (miss == 0) "Kadro tamam ✔" else "$miss oyuncu eksik", color = Color.White, fontSize = 13.sp)
+        }
+    }
+}
+
+@Composable
+fun MiniPitch(f: Formation) {
+    BoxWithConstraints(Modifier.fillMaxWidth().aspectRatio(0.8f).clip(RoundedCornerShape(10.dp)).background(Color(0xFF2E7D32))) {
+        val w = maxWidth
+        val h = maxHeight
+        for (s in f.slots) {
+            Box(Modifier.offset(x = w * (s.x / 100f) - 4.dp, y = h * (s.y / 100f) * 0.92f).size(8.dp).background(Color.White, CircleShape))
+        }
+    }
+}
+
+@Composable
+fun FormationScreen(st: SquadState, onDone: () -> Unit) {
+    var confirm by remember { mutableStateOf<Formation?>(null) }
+    var targetText by remember { mutableStateOf(st.target.toString()) }
+    Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(16.dp)) {
+        Text("Diziliş seç", fontSize = 24.sp, fontWeight = FontWeight.Bold)
+        Spacer(Modifier.height(8.dp))
+        OutlinedTextField(
+            value = targetText,
+            onValueChange = { t ->
+                targetText = t
+                val v = t.toIntOrNull()
+                if (v != null && v in 1..100) st.updateTarget(v)
+            },
+            label = { Text("Hedef reyting (1-100)") }, singleLine = true,
+            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+            modifier = Modifier.fillMaxWidth()
+        )
+        Spacer(Modifier.height(12.dp))
+        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+            for (f in Formations.all) {
+                Card(
+                    Modifier.weight(1f).clickable {
+                        val hasXi = st.players.keys.any { it.startsWith("xi") }
+                        if (st.formationId != null && st.formationId != f.id && hasXi) confirm = f
+                        else { st.setFormation(f.id); onDone() }
+                    },
+                    border = if (st.formationId == f.id) androidx.compose.foundation.BorderStroke(3.dp, Color(0xFF0D47A1)) else null
+                ) {
+                    Column(Modifier.padding(10.dp), horizontalAlignment = Alignment.CenterHorizontally) {
+                        MiniPitch(f)
+                        Spacer(Modifier.height(6.dp))
+                        Text(f.id, fontSize = 20.sp, fontWeight = FontWeight.Bold)
+                    }
+                }
+            }
+        }
+        if (st.formation != null) {
+            Spacer(Modifier.height(16.dp))
+            Button(onClick = onDone, modifier = Modifier.fillMaxWidth()) { Text("Mevcut dizilişle devam: ${st.formationId}") }
+        }
+    }
+    confirm?.let { f ->
+        AlertDialog(
+            onDismissRequest = { confirm = null },
+            title = { Text("Diziliş değişsin mi?") },
+            text = { Text("İlk 11'deki oyuncular silinir (yedekler kalır).") },
+            confirmButton = { TextButton(onClick = { st.setFormation(f.id); confirm = null; onDone() }) { Text("Değiştir") } },
+            dismissButton = { TextButton(onClick = { confirm = null }) { Text("İptal") } }
+        )
+    }
+}
+
+@Composable
+fun SlotCard(label: String, p: Pl?, warn: Boolean, modifier: Modifier, onClick: () -> Unit) {
+    val border = when {
+        p == null -> Color(0xFFFF5252)
+        warn -> Color(0xFFFFB300)
+        else -> Color(0xFF69F0AE)
+    }
+    Column(
+        modifier.width(62.dp).clip(RoundedCornerShape(8.dp)).background(Color(0xCC0B2A12))
+            .border(2.dp, border, RoundedCornerShape(8.dp)).clickable(onClick = onClick)
+            .padding(horizontal = 2.dp, vertical = 3.dp),
+        horizontalAlignment = Alignment.CenterHorizontally
+    ) {
+        Text(label, color = Color.White, fontSize = 11.sp, fontWeight = FontWeight.Bold)
+        Text(p?.name ?: "+ ekle", color = Color.White, fontSize = 9.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+        if (p != null) Text("${p.age}y·${p.rating}", color = Color(0xFFB0BEC5), fontSize = 9.sp)
+    }
+}
+
+@Composable
+fun PitchScreen(st: SquadState, onPick: () -> Unit, onTap: (Slot) -> Unit) {
+    val f = st.formation ?: return
+    val warns = st.warnings()
+    Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(10.dp)) {
+        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
+            Text("${f.id} · bir pozisyona dokun", fontWeight = FontWeight.Bold)
+            OutlinedButton(onClick = onPick) { Text("Diziliş") }
+        }
+        Spacer(Modifier.height(6.dp))
+        BoxWithConstraints(Modifier.fillMaxWidth().aspectRatio(0.72f).clip(RoundedCornerShape(12.dp)).background(Color(0xFF2E7D32))) {
+            val w = maxWidth
+            val h = maxHeight
+            for (s in f.slots) {
+                SlotCard(
+                    s.label, st.players[s.id], warns.containsKey(s.id),
+                    Modifier.offset(x = w * (s.x / 100f) - 31.dp, y = h * (s.y / 100f) * 0.88f)
+                ) { onTap(s) }
+            }
+        }
+        Spacer(Modifier.height(8.dp))
+        val miss = f.slots.filter { !st.players.containsKey(it.id) }
+        if (miss.isNotEmpty()) Text("Eksik ilk 11: ${miss.joinToString { it.label }}", color = Color(0xFFD32F2F))
+        for ((k, v) in warns) {
+            Text("⚠ ${st.slotById(k)?.label}: ${st.players[k]?.name} — $v", color = Color(0xFFEF6C00), fontSize = 13.sp)
+        }
+        Text("Kurallar otomasyon hazırlığında doğrulanır; ihlal varsa otomasyon ayarı oluşturulmaz.",
+            fontSize = 11.sp, color = Color.Gray)
+    }
+}
+
+@Composable
+fun SubsScreen(st: SquadState, onTap: (Slot) -> Unit) {
+    Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(12.dp)) {
+        val subCount = Formations.SUBS.count { st.players.containsKey(it.id) }
+        Text("Yedekler $subCount/9 (2 kaleci, 3 defans, 2 orta saha, 2 forvet)", fontWeight = FontWeight.Bold)
+        for (g in Formations.GROUP_ORDER) {
+            Spacer(Modifier.height(10.dp))
+            Text(Formations.GROUP_NAME[g] ?: g, fontSize = 16.sp, fontWeight = FontWeight.Bold)
+            for (s in Formations.SUBS.filter { it.group == g }) {
+                val p = st.players[s.id]
+                Card(
+                    Modifier.fillMaxWidth().padding(vertical = 3.dp).clickable { onTap(s) },
+                    border = if (p == null) androidx.compose.foundation.BorderStroke(2.dp, Color(0xFFFF5252)) else null
+                ) {
+                    Row(Modifier.fillMaxWidth().padding(12.dp), horizontalArrangement = Arrangement.SpaceBetween) {
+                        Text(s.label)
+                        Text(if (p != null) "${p.name} · ${p.age}y · ${p.rating}" else "Boş — dokun", fontWeight = FontWeight.Bold)
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+fun ChecklistScreen(st: SquadState, onEdit: (Slot) -> Unit) {
+    val ctx = LocalContext.current
+    var prepMessage by remember { mutableStateOf("") }
+    var purchaseAck by remember { mutableStateOf(false) }
+    val order = st.orderedSlots()
+    val errors = st.validationErrors()
+    Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(10.dp)) {
+        Text("Otomasyon hazırlığı", fontSize = 20.sp, fontWeight = FontWeight.Bold)
+        Text("20 oyuncunun tamamı ve kurallar doğrulanmadan otomasyon ayarı kaydedilmez.", fontSize = 12.sp)
+        Spacer(Modifier.height(8.dp))
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Checkbox(checked = purchaseAck, onCheckedChange = { purchaseAck = it })
+            Text("Bu sürüm bütçeyi doğrulamıyor; + düğmesi satın alma yapabilir. Riski kabul ediyorum.", fontSize = 12.sp)
+        }
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            Button(onClick = {
+                val result = st.prepareAutomation(purchaseAck)
+                prepMessage = if (result.isEmpty()) "Kadro doğrulandı ve otomasyon servisine aktarıldı." else result.joinToString("\n")
+            }) { Text("Otomasyon için hazırla") }
+            OutlinedButton(onClick = { ctx.startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)) }) {
+                Text("Erişilebilirlik izni")
+            }
+        }
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            OutlinedButton(onClick = { openOsm(ctx) }) { Text("OSM'yi aç") }
+            OutlinedButton(onClick = { st.resetProgress(); prepMessage = "İlerleme sıfırlandı." }) { Text("İlerlemeyi sıfırla") }
+        }
+        if (prepMessage.isNotBlank()) {
+            Spacer(Modifier.height(6.dp))
+            Text(prepMessage, color = if (prepMessage.startsWith("Kadro doğrulandı") || prepMessage.startsWith("İlerleme")) Color(0xFF2E7D32) else Color(0xFFD32F2F), fontSize = 12.sp)
+        }
+        Spacer(Modifier.height(8.dp))
+        if (errors.isNotEmpty()) {
+            Text("Düzeltmen gerekenler (${errors.size})", fontWeight = FontWeight.Bold, color = Color(0xFFD32F2F))
+            errors.forEach { Text("• $it", color = Color(0xFFD32F2F), fontSize = 12.sp) }
+        } else {
+            Text("Kadro kuralları uygun · 20/20", color = Color(0xFF2E7D32), fontWeight = FontWeight.Bold)
+        }
+        Spacer(Modifier.height(10.dp))
+        val added = order.count { st.done[it.id] == "added" }
+        Text("İşaretlenen oyuncu: $added/20", fontWeight = FontWeight.Bold)
+        order.forEachIndexed { i, slot ->
+            val p = st.players[slot.id]
+            Card(Modifier.fillMaxWidth().padding(vertical = 3.dp)) {
+                Column(Modifier.padding(10.dp)) {
+                    Text("${i + 1}. ${p?.name ?: "${slot.label} — eksik"}", fontSize = 17.sp, fontWeight = FontWeight.Bold)
+                    if (p != null) {
+                        Text("${p.pos} · ${p.age} yaş · reyting ${p.rating}" + if (p.priority) " · öncelikli yedek" else "", fontSize = 13.sp)
+                        Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                            OutlinedButton(onClick = { copyText(ctx, p.name) }) { Text("Kopyala") }
+                            TextButton(onClick = { onEdit(slot) }) { Text("Düzenle") }
+                            TextButton(onClick = { st.remove(slot.id) }) { Text("Sil") }
+                        }
+                    } else {
+                        TextButton(onClick = { onEdit(slot) }) { Text("Oyuncu ekle") }
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+fun JsonScreen(st: SquadState) {
+    val ctx = LocalContext.current
+    var text by remember { mutableStateOf("") }
+    var msg by remember { mutableStateOf("") }
+    Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(14.dp)) {
+        Text("Yedekle / paylaş", fontSize = 20.sp, fontWeight = FontWeight.Bold)
+        Text("Kadro otomatik olarak telefonda saklanır. JSON ile yedekleyebilir veya yükleyebilirsin.", fontSize = 13.sp)
+        Spacer(Modifier.height(8.dp))
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            Button(onClick = { copyText(ctx, st.toJson()); msg = "JSON panoya kopyalandı." }) { Text("JSON kopyala") }
+            OutlinedButton(onClick = {
+                val i = Intent(Intent.ACTION_SEND)
+                i.type = "text/plain"
+                i.putExtra(Intent.EXTRA_TEXT, st.toJson())
+                ctx.startActivity(Intent.createChooser(i, "Kadroyu paylaş"))
+            }) { Text("Paylaş") }
+        }
+        Spacer(Modifier.height(16.dp))
+        Text("İçe aktar", fontWeight = FontWeight.Bold)
+        OutlinedTextField(value = text, onValueChange = { text = it }, label = { Text("JSON yapıştır") },
+            modifier = Modifier.fillMaxWidth(), minLines = 4)
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            OutlinedButton(onClick = {
+                val cm = ctx.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                text = cm.primaryClip?.getItemAt(0)?.text?.toString() ?: ""
+            }) { Text("Panodan yapıştır") }
+            Button(onClick = {
+                val e = st.fromJson(text)
+                msg = e ?: "İçe aktarıldı: ${st.players.size}/20"
+            }) { Text("İçe aktar") }
+        }
+        if (msg.isNotEmpty()) Text(msg, color = if (msg.startsWith("JSON okunamadı") || msg.contains("Geçersiz") || msg.contains("Tekrar")) Color(0xFFD32F2F) else Color(0xFF2E7D32))
+    }
+}
+
+@Composable
+fun PlayerDialog(st: SquadState, slot: Slot, onClose: () -> Unit) {
+    val cur = st.players[slot.id]
+    var name by remember(slot.id) { mutableStateOf(cur?.name ?: "") }
+    var age by remember(slot.id) { mutableStateOf(cur?.age?.toString() ?: "") }
+    var rating by remember(slot.id) { mutableStateOf(cur?.rating?.toString() ?: "") }
+    var pos by remember(slot.id) { mutableStateOf(cur?.pos ?: st.defaultPosition(slot)) }
+    var priority by remember(slot.id) { mutableStateOf(cur?.priority ?: false) }
+    var posMenu by remember(slot.id) { mutableStateOf(false) }
+    var err by remember(slot.id) { mutableStateOf<String?>(null) }
+    val choices = Formations.POSITIONS[slot.group] ?: emptyList()
+    AlertDialog(
+        onDismissRequest = onClose,
+        title = { Text(slot.label) },
+        text = {
+            Column {
+                OutlinedTextField(value = name, onValueChange = { name = it }, label = { Text("Oyuncu adı") }, singleLine = true,
+                    keyboardOptions = KeyboardOptions(capitalization = KeyboardCapitalization.Words), modifier = Modifier.fillMaxWidth())
+                Spacer(Modifier.height(6.dp))
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    OutlinedTextField(value = age, onValueChange = { age = it }, label = { Text("Yaş") }, singleLine = true,
+                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number), modifier = Modifier.weight(1f))
+                    OutlinedTextField(value = rating, onValueChange = { rating = it }, label = { Text("Reyting") }, singleLine = true,
+                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number), modifier = Modifier.weight(1f))
+                }
+                if (slot.id.startsWith("xi")) {
+                    Text("İlk 11 pozisyonu: ${slot.label}", fontSize = 13.sp)
+                } else {
+                    Box {
+                        OutlinedButton(onClick = { posMenu = true }) { Text("Pozisyon: $pos ▾") }
+                        DropdownMenu(expanded = posMenu, onDismissRequest = { posMenu = false }) {
+                            choices.forEach { choice ->
+                                DropdownMenuItem(text = { Text(choice) }, onClick = { pos = choice; posMenu = false })
+                            }
+                        }
+                    }
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Checkbox(checked = priority, onCheckedChange = { priority = it })
+                        Text("Öncelikli yedek (hedef reyting, 20-29 yaş)", fontSize = 12.sp)
+                    }
+                }
+                err?.let { Text(it, color = Color(0xFFD32F2F), fontSize = 13.sp) }
+                if (cur != null) TextButton(onClick = { st.remove(slot.id); onClose() }) { Text("Oyuncuyu sil") }
+            }
+        },
+        confirmButton = {
+            Button(onClick = {
+                val a = age.toIntOrNull()
+                val r = rating.toIntOrNull()
+                when {
+                    name.isBlank() -> err = "İsim gerekli"
+                    a == null || a !in 1..60 -> err = "Yaş (1-60) gir"
+                    r == null || r !in 1..100 -> err = "Reyting (1-100) gir"
+                    else -> {
+                        val e = st.put(slot.id, Pl(name.trim(), a, r, pos, priority))
+                        if (e == null) onClose() else err = e
+                    }
+                }
+            }) { Text("Kaydet") }
+        },
+        dismissButton = { TextButton(onClick = onClose) { Text("İptal") } }
+    )
+}
+
+=== FILE: app/src/main/java/app/osmsquad/Matcher.kt ===
+package app.osmsquad
+
+import java.text.Normalizer
+
+/** Oyuncuyu yalnızca adla değil; ad + yaş + pozisyon + reyting ile eşleştirir. */
+object Matcher {
+    private val MARKS = Regex("\\p{M}")
+    private val NONLET = Regex("[^a-z]")
+
+    fun n(s: String): String = Normalizer.normalize(s.replace('ı', 'i').replace('İ', 'I'), Normalizer.Form.NFD)
+        .replace(MARKS, "").lowercase().replace(NONLET, "")
+
+    fun lev(a: String, b: String): Int {
+        val d = IntArray(b.length + 1) { it }
+        for (i in 1..a.length) {
+            var p = d[0]; d[0] = i
+            for (j in 1..b.length) {
+                val t = d[j]
+                d[j] = minOf(d[j] + 1, d[j - 1] + 1, p + if (a[i - 1] == b[j - 1]) 0 else 1)
+                p = t
+            }
+        }
+        return d[b.length]
+    }
+
+    fun nameOk(a: String, b: String): Boolean {
+        val x = n(a); val y = n(b)
+        if (x.isEmpty() || y.isEmpty()) return false
+        // OCR can confuse one character even in short names (e.g. Epolo/EpoIo).
+        // Age + position + rating are checked separately before a row is accepted.
+        return x == y || (minOf(x.length, y.length) >= 4 && lev(x, y) <= 1)
+    }
+
+    private fun nameAppears(expected: String, text: String): Boolean {
+        val target = n(expected)
+        val tokens = Regex("[\\p{L}]+")
+            .findAll(text)
+            .map { n(it.value) }
+            .filter { it.isNotEmpty() }
+            .toList()
+        if (target.isEmpty()) return false
+        if (tokens.any { nameOk(target, it) }) return true
+        val expectedParts = expected.trim().split(Regex("\\s+")).filter { it.isNotBlank() }
+        if (expectedParts.size > 1 && tokens.size >= expectedParts.size) {
+            val width = expectedParts.size
+            for (i in 0..tokens.size - width) {
+                if (nameOk(n(expectedParts.joinToString("") ), tokens.subList(i, i + width).joinToString(""))) return true
+            }
+        }
+        return n(text).contains(target)
+    }
+
+    /**
+     * Target-guided OCR fallback. OSM sometimes renders a player's name/age and
+     * table cells as separate OCR lines, so the legacy whole-row regex can miss
+     * a visible player. We anchor on the requested name, collect nearby lines,
+     * then require the exact age and position. Outfield rows must also contain
+     * the requested rating in the correct H/D/O stat column.
+     */
+    fun matchOcr(t: AutoPlayer, lines: List<Ln>, screenHeight: Int): List<Row> {
+        val band = maxOf(28, (screenHeight * 0.065f).toInt())
+        val candidates = linkedMapOf<Int, Row>()
+        val anchors = lines.filter { nameAppears(t.name, it.text) }
+        for (anchor in anchors) {
+            val y = anchor.box.centerY()
+            val near = lines.filter { kotlin.math.abs(it.box.centerY() - y) <= band }
+            val combined = near.sortedWith(compareBy<Ln> { it.box.centerY() }.thenBy { it.box.left })
+                .joinToString(" ") { it.text }
+            if (!nameAppears(t.name, combined)) continue
+            val rowY = near.map { it.box.centerY() }.average().toInt()
+
+            val ageTokens = Regex("\\d{1,2}")
+                .findAll(combined)
+                .mapNotNull { it.value.toIntOrNull() }
+                .toList()
+            if (t.age !in ageTokens) continue
+
+            val posTokens = Regex("[\\p{L}]+")
+                .findAll(combined)
+                .map { Parser.pos(it.value) }
+                .toList()
+            if (posTokens.none { canon(it) == canon(t.pos) }) continue
+
+            val fallbackRow = if (t.col == "k") {
+                // OSM goalkeeper row exposes a KL position and outfield stat columns;
+                // the keeper rating itself is not represented as H/D/O.
+                Row(t.name, t.age, "", t.pos, 0, 0, 0, rowY)
+            } else {
+                val positionMatch = Regex(
+                    "(?i)(?<![A-ZĞÜİŞÇ])(?:KLC|KL|SLB|STP|SĞB|SGB|OS|OOS|SLA|SF|SĞA|SGA)(?![A-ZĞÜİŞÇ])"
+                ).find(combined) ?: continue
+                val suffix = combined.substring(positionMatch.range.last + 1)
+                val values = Regex("(?<!\\d)\\d{1,3}(?!\\d)")
+                    .findAll(suffix)
+                    .mapNotNull { it.value.toIntOrNull() }
+                    .toList()
+                val index = when (t.col) { "h" -> 0; "d" -> 1; "o" -> 2; else -> -1 }
+                if (index !in values.indices || values[index] != t.rating) continue
+                val stats = values.take(3)
+                Row(t.name, t.age, "", t.pos,
+                    stats.getOrElse(0) { 0 }, stats.getOrElse(1) { 0 }, stats.getOrElse(2) { 0 }, rowY)
+            }
+            // Collapse multiple OCR anchors from the same physical player row.
+            candidates[y / maxOf(24, band / 2)] = fallbackRow
+        }
+        return candidates.values.toList()
+    }
+
+    private fun col(c: String, r: Row): Int? = when (c) { "h" -> r.h; "d" -> r.d; "o" -> r.o; else -> null }
+
+    /** Kaleci (col "k") reytingi listede görünmediği için reyting karşılaştırması atlanır. */
+    private fun canon(p: String) = if (p == "KLC") "KL" else p
+
+    fun match(t: AutoPlayer, rows: List<Row>): List<Row> = rows.filter { r ->
+        nameOk(t.name, r.name) && (t.age == 0 || r.age == t.age) && canon(r.pos) == canon(t.pos) &&
+            (col(t.col, r)?.let { it == t.rating } ?: true)
+    }
+}
+
+=== FILE: app/src/main/java/app/osmsquad/Model.kt ===
+package app.osmsquad
+
+data class Pl(
+    val name: String,
+    val age: Int,
+    val rating: Int,
+    val pos: String = "",
+    val priority: Boolean = false
+)
+
+data class Slot(val id: String, val label: String, val group: String, val x: Float = 0f, val y: Float = 0f)
+data class Formation(val id: String, val slots: List<Slot>)
+
+/** Diziliş şablonları. x/y değerleri uygulama içi görselleştirme içindir; OSM ekran koordinatı değildir. */
+object Formations {
+    private fun s(i: Int, l: String, g: String, x: Float, y: Float) = Slot("xi$i", l, g, x, y)
+
+    val F433 = Formation("4-3-3A", listOf(
+        s(0, "KL", "GK", 50f, 90f),
+        s(1, "SLB", "DF", 22f, 57f), s(2, "STP", "DF", 41f, 63f), s(3, "STP", "DF", 59f, 63f), s(4, "SĞB", "DF", 78f, 57f),
+        s(5, "OS", "MD", 31f, 34f), s(6, "OOS", "MD", 50f, 25f), s(7, "OS", "MD", 69f, 34f),
+        s(8, "SLA", "FW", 31f, 9f), s(9, "SF", "FW", 50f, 4f), s(10, "SĞA", "FW", 69f, 9f)
+    ))
+
+    val F523 = Formation("5-2-3A", listOf(
+        s(0, "KL", "GK", 50f, 90f),
+        s(1, "SLB", "DF", 12f, 54f), s(2, "STP", "DF", 31f, 59f), s(3, "STP", "DF", 50f, 63f),
+        s(4, "STP", "DF", 69f, 59f), s(5, "SĞB", "DF", 87f, 54f),
+        s(6, "OS", "MD", 34f, 32f), s(7, "OS", "MD", 66f, 32f),
+        s(8, "SLA", "FW", 31f, 9f), s(9, "SF", "FW", 50f, 4f), s(10, "SĞA", "FW", 69f, 9f)
+    ))
+
+    val all = listOf(F433, F523)
+    val SUBS = listOf(
+        Slot("gk0", "Yedek Kaleci 1", "GK"), Slot("gk1", "Yedek Kaleci 2", "GK"),
+        Slot("df0", "Yedek Defans 1", "DF"), Slot("df1", "Yedek Defans 2", "DF"), Slot("df2", "Yedek Defans 3", "DF"),
+        Slot("md0", "Yedek Orta saha 1", "MD"), Slot("md1", "Yedek Orta saha 2", "MD"),
+        Slot("fw0", "Yedek Forvet 1", "FW"), Slot("fw1", "Yedek Forvet 2", "FW")
+    )
+    val GROUP_NAME = mapOf("GK" to "Kaleciler", "DF" to "Defanslar", "MD" to "Orta sahalar", "FW" to "Forvetler")
+    val GROUP_ORDER = listOf("GK", "DF", "MD", "FW")
+    val POSITIONS = mapOf(
+        "GK" to listOf("KL"),
+        "DF" to listOf("SLB", "STP", "SĞB"),
+        "MD" to listOf("OS", "OOS"),
+        "FW" to listOf("SLA", "SF", "SĞA")
+    )
+
+    fun groupOfPosition(pos: String): String? = when (pos.uppercase()) {
+        "KL", "KLC" -> "GK"
+        "SLB", "STP", "SĞB" -> "DF"
+        "OS", "OOS" -> "MD"
+        "SLA", "SF", "SĞA" -> "FW"
+        else -> null
+    }
+}
+
+=== FILE: app/src/main/java/app/osmsquad/Ocr.kt ===
+package app.osmsquad
+
+import android.graphics.Bitmap
+import android.graphics.Rect
+import com.google.mlkit.vision.common.InputImage
+import com.google.mlkit.vision.text.TextRecognition
+import com.google.mlkit.vision.text.latin.TextRecognizerOptions
+import kotlinx.coroutines.suspendCancellableCoroutine
+import kotlin.coroutines.resume
+
+data class Ln(val text: String, val box: Rect)
+data class TRow(val text: String, val y: Int)
+
+object Ocr {
+    private val rec by lazy { TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS) }
+    private val CNT = Regex("""(\d{1,2})\s*/\s*20""")
+
+    suspend fun lines(b: Bitmap): List<Ln>? = suspendCancellableCoroutine<List<Ln>?> { c ->
+        rec.process(InputImage.fromBitmap(b, 0))
+            .addOnSuccessListener { r ->
+                c.resume(r.textBlocks.flatMap { it.lines }.mapNotNull { l -> l.boundingBox?.let { Ln(l.text, it) } })
+            }
+            .addOnFailureListener { c.resume(null) }
+    }
+
+    /** Aynı yatay hizadaki hücreleri tek satırda birleştirir. */
+    fun rows(ls: List<Ln>): List<TRow> {
+        if (ls.isEmpty()) return emptyList()
+        val sorted = ls.sortedBy { it.box.centerY() }
+        val tol = (sorted.map { it.box.height() }.sorted()[sorted.size / 2] * 0.6).toInt().coerceAtLeast(6)
+        val groups = mutableListOf<MutableList<Ln>>()
+        for (l in sorted) {
+            val g = groups.lastOrNull()
+            if (g != null && Math.abs(l.box.centerY() - g.map { it.box.centerY() }.average()) < tol) g.add(l)
+            else groups.add(mutableListOf(l))
+        }
+        return groups.map { g ->
+            TRow(g.sortedBy { it.box.left }.joinToString(" ") { it.text }, g.map { it.box.centerY() }.average().toInt())
+        }
+    }
+
+    /** Üst çubuktaki "n / 20" sayacı; seçimlerin doğrulanması bununla yapılır. */
+    fun counter(ls: List<Ln>, h: Int): Int? {
+        val top = ls.filter { it.box.centerY() < h * 0.15 }.sortedBy { it.box.left }.joinToString(" ") { it.text }
+        return CNT.find(top)?.groupValues?.get(1)?.toInt()
+    }
+
+    /**
+     * Pitch slotuna dokununca açılan kategori seçme ekranı; dört grup başlığını
+     * aynı anda gösterir ve her grubun satırında ayrı bir mavi + düğmesi bulunur.
+     * Bu ekran oyuncu arama sonuçlarıyla karıştırılmamalıdır.
+     */
+    fun isCategoryChooser(ls: List<Ln>): Boolean {
+        val groups = ls.mapNotNull { categoryGroup(it.text) }.toSet()
+        return groups.size >= 2
+    }
+
+    private fun categoryGroup(text: String): String? {
+        val t = Matcher.n(text)
+        return when {
+            t.contains("kaleci") || t.contains("goalkeeper") -> "GK"
+            t.contains("defans") || t.contains("defender") -> "DF"
+            t.contains("ortasaha") || t.contains("midfielder") -> "MD"
+            t.contains("forvet") || t.contains("forward") || t.contains("attacker") -> "FW"
+            else -> null
+        }
+    }
+
+    /** Kategori seçme ekranı hariç, OSM oyuncu tablosunun başlıklarını tanır. */
+    fun isList(ls: List<Ln>): Boolean {
+        if (ls.isEmpty() || isCategoryChooser(ls)) return false
+        val t = Matcher.n(ls.joinToString(" ") { it.text })
+        val hasPrice = t.contains("fiyat") || t.contains("price")
+        val hasPositionColumn = t.contains("poz") || t.contains("position")
+        val hasNationalityColumn = t.contains("uyr") || t.contains("nationality")
+        return hasPrice && (hasPositionColumn || hasNationalityColumn)
+    }
+}
+
+=== FILE: app/src/main/java/app/osmsquad/OsmService.kt ===
+package app.osmsquad
+
+import android.accessibilityservice.AccessibilityService
+import android.accessibilityservice.GestureDescription
+import android.content.ClipData
+import android.content.ClipboardManager
+import android.content.Context
+import android.graphics.Bitmap
+import android.graphics.Path
+import android.graphics.PixelFormat
+import android.graphics.Rect
+import android.os.Bundle
+import android.view.Display
+import android.view.Gravity
+import android.view.View
+import android.view.WindowManager
+import android.view.accessibility.AccessibilityEvent
+import android.view.accessibility.AccessibilityNodeInfo
+import android.view.accessibility.AccessibilityWindowInfo
+import android.widget.Button
+import android.widget.LinearLayout
+import android.widget.TextView
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.suspendCancellableCoroutine
+import org.json.JSONArray
+import kotlin.coroutines.resume
+import kotlin.math.max
+import kotlin.math.min
+
+private data class Cap(val lines: List<Ln>, val bitmap: Bitmap) {
+    val w: Int get() = bitmap.width
+    val h: Int get() = bitmap.height
+}
+
+/**
+ * OSM automasyon servisi.
+ * Ekran tanınması kesin değilse dokunmayı durdurur. Pitch konumu renk alanından,
+ * kategori ve oyuncu satırları OCR'dan; erişilebilir metin varsa node bounds'tan alınır.
+ */
+class OsmService : AccessibilityService() {
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
+    private var job: Job? = null
+    private var wm: WindowManager? = null
+    private var panel: LinearLayout? = null
+    private lateinit var info: TextView
+    private lateinit var prog: TextView
+    private var squad: Squad? = null
+    private val done = linkedSetOf<String>()
+    private var lastShot = 0L
+    private var current = ""
+
+    private val prefs get() = getSharedPreferences("osm", Context.MODE_PRIVATE)
+    private val targetPkg get() = prefs.getString("pkg", "com.gamebasics.osm") ?: "com.gamebasics.osm"
+    private val waitMs get() = prefs.getLong("waitMs", 1000L).coerceIn(300L, 5000L)
+    private val retries get() = prefs.getInt("retries", 2).coerceIn(0, 5)
+    private val plusX get() = prefs.getFloat("plusX", 0.924f).coerceIn(0.55f, 0.99f)
+
+    private var evPkg: String? = null
+    override fun onAccessibilityEvent(e: AccessibilityEvent?) {
+        val p = e?.packageName?.toString() ?: return
+        if (p != packageName && !p.startsWith("com.android.systemui") && !p.contains("inputmethod") && !p.contains("keyboard")) evPkg = p
+    }
+
+    private fun fgPkg(): String? {
+        val active = rootInActiveWindow?.packageName?.toString()
+        return if (active != null && active != packageName) active else evPkg
+    }
+
+    override fun onInterrupt() { stop() }
+    override fun onDestroy() {
+        scope.cancel()
+        panel?.let { runCatching { wm?.removeView(it) } }
+        super.onDestroy()
+    }
+
+    override fun onServiceConnected() {
+        super.onServiceConnected()
+        wm = getSystemService(Context.WINDOW_SERVICE) as WindowManager
+        val box = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setBackgroundColor(0xE6102040.toInt())
+            setPadding(14, 10, 14, 10)
+        }
+        info = TextView(this).apply { setTextColor(-1); textSize = 12f }
+        prog = TextView(this).apply { setTextColor(-1); textSize = 14f }
+        val buttons = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        fun button(label: String, action: () -> Unit) {
+            buttons.addView(Button(this).apply {
+                text = label
+                textSize = 10f
+                setOnClickListener { action() }
+            })
+        }
+        button("BAŞLAT") { start() }
+        button("DURAKLAT") { pause("Kullanıcı duraklattı") }
+        button("DEVAM") { start() }
+        button("DURDUR") { stop() }
+        val tools = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        tools.addView(Button(this).apply { text = "TANI"; textSize = 10f; setOnClickListener { diagnose() } })
+        box.addView(info); box.addView(prog); box.addView(buttons); box.addView(tools)
+        val lp = WindowManager.LayoutParams(
+            WindowManager.LayoutParams.WRAP_CONTENT,
+            WindowManager.LayoutParams.WRAP_CONTENT,
+            WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,
+            PixelFormat.TRANSLUCENT
+        ).apply { gravity = Gravity.TOP or Gravity.START; y = 80 }
+        wm?.addView(box, lp)
+        panel = box
+        load()
+        render("Hazır. OSM kadro/saha ekranını açıp BAŞLAT'a bas.")
+    }
+
+    private fun load() {
+        squad = prefs.getString("squad", null)?.let { runCatching { SquadIO.parse(it) }.getOrNull() }
+        done.clear()
+        val saved = runCatching { JSONArray(prefs.getString("done", "[]")) }.getOrNull()
+        if (saved != null) for (i in 0 until saved.length()) done.add(saved.optString(i))
+    }
+
+    private fun save() { prefs.edit().putString("done", JSONArray(done.toList()).toString()).apply() }
+
+    private fun render(message: String) {
+        val s = squad
+        info.text = (if (s != null) "${s.formation} · hedef ${s.target}" else "Kadro yok") +
+            (if (current.isNotEmpty()) "\nŞu an: $current" else "") + "\n$message"
+        prog.text = "${done.size}/20"
+    }
+
+    private fun start() {
+        load()
+        if (squad == null) { render("Önce uygulamada 20 oyuncuyu girip otomasyon hazırlığını yap."); return }
+        if (!prefs.getBoolean("allowPurchase", false)) { render("Otomasyon kapalı: satın alma riski onayı yok."); return }
+        if (job?.isActive == true) return
+        job = scope.launch {
+            try { runAll() }
+            catch (e: CancellationException) { render("DURAKLADI") }
+            catch (e: Exception) { fail("Beklenmeyen hata: ${e.message}") }
+        }
+    }
+
+    private fun pause(why: String) { job?.cancel(); render("DURAKLADI: $why") }
+    private fun stop() { job?.cancel(); current = ""; render("Durduruldu. Tamamlananlar kaydedildi.") }
+    private fun fail(message: String): Boolean { pause(message); return false }
+
+    private suspend fun runAll() {
+        val s = squad ?: return
+        if (fgPkg() != targetPkg) { fail("Önce OSM'yi aç. Algılanan paket: ${fgPkg() ?: "yok"}"); return }
+        for (p in s.players.sortedBy { it.order }) {
+            currentCoroutineContext().ensureActive()
+            if (p.key in done) continue
+            current = "${p.name} (${p.slot} · ${p.pos})"
+            render("Boş mevki → kategori + → oyuncu arama…")
+            if (!preparePlayerList(p)) return
+            if (!stepInList(p)) return
+        }
+        current = ""
+        val final = capture()
+        val count = final?.let { Ocr.counter(it.lines, it.h) }
+        render(if (count == 20) "20/20 sayaç doğrulandı." else "20 oyuncu işlendi; son sayaç doğrulanamadı ($count). Ekranı kontrol et.")
+    }
+
+    /**
+     * OSM akışı: saha/yedek yuvasına dokun → kategori ekranında ilgili satırın
+     * mavi + düğmesine dokun → oyuncu arama ekranını aç.
+     * Kategori başlığının kendisine dokunulmaz; her kategori için ayrı + vardır.
+     */
+    private suspend fun preparePlayerList(p: AutoPlayer): Boolean {
+        var cap = capture() ?: return fail("Ekran görüntüsü alınamadı")
+        if (fgPkg() != targetPkg) return fail("OSM ön planda değil")
+
+        val group = Formations.groupOfPosition(p.pos)
+            ?: return fail("Pozisyon grubu tanınmadı: ${p.pos}")
+        var chooserOpen = Ocr.isCategoryChooser(cap.lines)
+        var resultsOpen = Ocr.isList(cap.lines)
+
+        // DEVAM'a basıldığında arama listesi veya kategori seçimi zaten açıksa,
+        // aynı yuvaya tekrar dokunmadan mevcut adımdan devam et.
+        if (!chooserOpen && !resultsOpen && findEditable() != null) resultsOpen = true
+
+        if (!chooserOpen && !resultsOpen) {
+            if (p.slot.startsWith("xi")) {
+                val formation = Formations.all.firstOrNull { it.id == squad?.formation }
+                    ?: return fail("Diziliş tanınmıyor")
+                val slot = formation.slots.firstOrNull { it.id == p.slot }
+                    ?: return fail("Saha yuvası bulunamadı: ${p.slot}")
+                val rect = detectPitchBounds(cap.bitmap)
+                    ?: return fail("Saha alanı güvenilir biçimde algılanamadı. Dokunma yapılmadı.")
+                val x = rect.left + rect.width() * (slot.x / 100f)
+                val y = rect.top + rect.height() * (slot.y / 100f)
+                if (x !in 0f..cap.w.toFloat() || y !in 0f..cap.h.toFloat()) {
+                    return fail("Saha koordinatı ekran dışında")
+                }
+                render("${slot.label} saha yuvası seçiliyor…")
+                if (!gesture(Path().apply { moveTo(x, y) }, 70)) {
+                    return fail("Saha yuvasına dokunulamadı")
+                }
+            } else {
+                // Yedek yuvası seçimi: önce yedek alanını aç, sonra istenen boş yuvayı seç.
+                if (!tapNamedNode(listOf("yedekler", "subs", "bench"))) {
+                    return fail("Yedekler sekmesi tanınmadı; yanlış ekrana dokunmadım.")
+                }
+                delay(waitMs)
+                if (!tapNamedNode(listOf(p.slot, subLabel(p.slot)))) {
+                    return fail("${p.slot} yedek yuvası bulunamadı.")
+                }
+            }
+            delay(waitMs)
+            cap = capture() ?: return fail("Mevki seçildikten sonra ekran okunamadı")
+            chooserOpen = Ocr.isCategoryChooser(cap.lines)
+            resultsOpen = Ocr.isList(cap.lines)
+        }
+
+        if (chooserOpen) {
+            render("${Formations.GROUP_NAME[group]} kategorisinin + düğmesi seçiliyor…")
+            if (!tapCategoryPlus(cap, group)) {
+                return fail("${Formations.GROUP_NAME[group]} satırındaki + düğmesi bulunamadı; yanlış kategoriye dokunmadım.")
+            }
+            delay(waitMs)
+            cap = capture() ?: return fail("Kategori + düğmesinden sonra ekran okunamadı")
+            if (Ocr.isCategoryChooser(cap.lines)) {
+                return fail("${Formations.GROUP_NAME[group]} + düğmesine basıldı ancak kategori ekranı kapanmadı.")
+            }
+            resultsOpen = Ocr.isList(cap.lines)
+        }
+
+        if (!resultsOpen && findEditable() == null) {
+            // Bazı OSM sürümlerinde + düğmesi önce listeyi açar, arama alanı
+            // ayrıca büyüteç düğmesiyle görünür hâle gelir.
+            if (!tapSearchControl(cap)) return fail("Kategori seçildi ancak oyuncu arama ekranı doğrulanamadı")
+            delay(waitMs)
+            cap = capture() ?: return fail("Arama ekranı okunamadı")
+        }
+
+        if (!Ocr.isList(cap.lines) && findEditable() == null) {
+            return fail("Oyuncu listesi açılmadı; isim aramasına geçmedim.")
+        }
+        return true
+    }
+
+    private suspend fun returnToCorrectRosterScreen(p: AutoPlayer): Boolean {
+        var cap = capture() ?: return false
+        val isSub = p.role == "SUB"
+        fun expected(c: Cap): Boolean = if (isSub) {
+            c.lines.any { Matcher.n(it.text).contains("yedek") || Matcher.n(it.text).contains("bench") || Matcher.n(it.text).contains("substitute") }
+        } else detectPitchBounds(c.bitmap) != null
+
+        var attempts = 0
+        while (Ocr.isList(cap.lines) && attempts < 2) {
+            clearSearch()
+            performGlobalAction(GLOBAL_ACTION_BACK)
+            delay(waitMs)
+            cap = capture() ?: return false
+            attempts++
+        }
+        if (expected(cap)) return true
+        // Bazı sürümlerde önce kategori penceresine, sonra saha ekranına dönülür.
+        while (attempts < 3 && !expected(cap)) {
+            if (!cap.lines.any { line ->
+                    val v = Matcher.n(line.text)
+                    listOf("kaleci", "defans", "ortasaha", "forvet").any { v.contains(it) }
+                }) return false
+            performGlobalAction(GLOBAL_ACTION_BACK)
+            delay(waitMs)
+            cap = capture() ?: return false
+            attempts++
+        }
+        return expected(cap)
+    }
+
+    private fun subLabel(slot: String): String = when {
+        slot.startsWith("gk") -> "Yedek Kaleci ${slot.takeLast(1).toIntOrNull()?.plus(1) ?: 1}"
+        slot.startsWith("df") -> "Yedek Defans ${slot.takeLast(1).toIntOrNull()?.plus(1) ?: 1}"
+        slot.startsWith("md") -> "Yedek Orta saha ${slot.takeLast(1).toIntOrNull()?.plus(1) ?: 1}"
+        slot.startsWith("fw") -> "Yedek Forvet ${slot.takeLast(1).toIntOrNull()?.plus(1) ?: 1}"
+        else -> slot
+    }
+
+    private fun categoryGroup(text: String): String? {
+        val value = Matcher.n(text)
+        return when {
+            value.contains("kaleci") || value.contains("goalkeeper") -> "GK"
+            value.contains("defans") || value.contains("defender") -> "DF"
+            value.contains("ortasaha") || value.contains("midfielder") -> "MD"
+            value.contains("forvet") || value.contains("forward") || value.contains("attacker") -> "FW"
+            else -> null
+        }
+    }
+
+    private fun tapCategoryPlus(cap: Cap, group: String): Boolean {
+        // Aynı grup için kısa kategori başlığı ile açıklama satırını ayırt et:
+        // "Kaleciler" başlıktır, "Kaleciler bölgesi için ..." ise + satırıdır.
+        val matching = cap.lines.filter { categoryGroup(it.text) == group }
+        val heading = matching.minByOrNull { Matcher.n(it.text).length } ?: return false
+        val headings = matchingCategoryHeadings(cap.lines)
+        val nextHeading = headings.filter { it.second.box.centerY() > heading.box.centerY() }
+            .minByOrNull { it.second.box.centerY() }
+        val previousHeading = headings.filter { it.second.box.centerY() < heading.box.centerY() }
+            .maxByOrNull { it.second.box.centerY() }
+
+        val description = matching.filter { it !== heading && it.box.centerY() > heading.box.centerY() }
+            .minByOrNull { it.box.centerY() - heading.box.centerY() }
+        val estimatedRowY = if (nextHeading != null) {
+            (heading.box.bottom + nextHeading.second.box.top) / 2
+        } else {
+            // Son kategori (genellikle Kaleciler) için bölüm yüksekliğini önceki
+            // başlık aralığından tahmin et; ekranın altındaki saha alanına kayma.
+            val gap = previousHeading?.let { heading.box.centerY() - it.second.box.centerY() }
+                ?: (cap.h * 0.16f).toInt()
+            heading.box.centerY() + gap / 2
+        }
+        val rowY = description?.box?.centerY() ?: estimatedRowY
+        val halfBand = max(44, (cap.h * 0.055f).toInt())
+        val top = max(0, rowY - halfBand)
+        val bottom = min(cap.h - 1, rowY + halfBand)
+
+        // Tercih edilen yöntem: ekrandaki mavi dairesel + ikonunu görüntüden bul.
+        val icon = findBluePlusCenter(cap.bitmap, top, bottom)
+        if (icon != null) return dispatchTap(icon.first, icon.second)
+
+        // WebView erişilebilirlik ağacı + düğmesine bounds veriyorsa onu kullan.
+        val root = rootInActiveWindow
+        var best: Rect? = null
+        var bestArea = Int.MAX_VALUE
+        fun walk(node: AccessibilityNodeInfo?) {
+            if (node == null) return
+            if (node.isVisibleToUser && node.isClickable) {
+                val bounds = Rect()
+                node.getBoundsInScreen(bounds)
+                val rightSide = bounds.centerX() >= cap.w * 0.82f
+                val inRow = bounds.centerY() in top..bottom
+                val sizeOk = bounds.width() in 12..150 && bounds.height() in 12..150
+                val area = bounds.width() * bounds.height()
+                if (rightSide && inRow && sizeOk && area < bestArea) {
+                    best = bounds
+                    bestArea = area
+                }
+            }
+            for (i in 0 until node.childCount) walk(node.getChild(i))
+        }
+        walk(root)
+        val b = best ?: return false
+        return dispatchTap(b.centerX().toFloat(), b.centerY().toFloat())
+    }
+
+    private fun matchingCategoryHeadings(lines: List<Ln>): List<Pair<String, Ln>> {
+        return listOf("FW", "MD", "DF", "GK").mapNotNull { group ->
+            lines.filter { categoryGroup(it.text) == group }
+                .minByOrNull { Matcher.n(it.text).length }
+                ?.let { group to it }
+        }.sortedBy { it.second.box.centerY() }
+    }
+
+    /** Mavi + simgesinin (beyaz artı merkezli) mavi çevresini bulur. */
+    private fun findBluePlusCenter(bitmap: Bitmap, top: Int, bottom: Int): Pair<Float, Float>? {
+        val left = (bitmap.width * 0.82f).toInt().coerceAtLeast(0)
+        val right = (bitmap.width * 0.985f).toInt().coerceAtMost(bitmap.width - 1)
+        val y0 = top.coerceIn(0, bitmap.height - 1)
+        val y1 = bottom.coerceIn(y0, bitmap.height - 1)
+        var count = 0
+        var sumX = 0L
+        var sumY = 0L
+        var minX = Int.MAX_VALUE
+        var maxX = Int.MIN_VALUE
+        var minY = Int.MAX_VALUE
+        var maxY = Int.MIN_VALUE
+        for (y in y0..y1 step 2) {
+            for (x in left..right step 2) {
+                val color = bitmap.getPixel(x, y)
+                val r = (color shr 16) and 0xff
+                val g = (color shr 8) and 0xff
+                val b = color and 0xff
+                if (b > 170 && g > 95 && b > g * 1.05f && g > r * 1.4f && b > r * 1.6f) {
+                    count++
+                    sumX += x
+                    sumY += y
+                    minX = min(minX, x); maxX = max(maxX, x)
+                    minY = min(minY, y); maxY = max(maxY, y)
+                }
+            }
+        }
+        val width = maxX - minX
+        val height = maxY - minY
+        if (count < 18 || width !in 12..90 || height !in 12..90) return null
+        return (sumX.toFloat() / count) to (sumY.toFloat() / count)
+    }
+
+    private suspend fun stepInList(p: AutoPlayer): Boolean {
+        var scrolls = 0
+        var lastSig = ""
+        var searchTries = 0
+        if (!ensureSearchField(p.name)) return fail("Arama kutusu bulunamadı")
+        delay(waitMs)
+
+        while (true) {
+            currentCoroutineContext().ensureActive()
+            val cap = capture() ?: return fail("Ekran görüntüsü/OCR alınamadı")
+            if (fgPkg() != targetPkg) return fail("OSM ön planda değil")
+            if (!Ocr.isList(cap.lines)) return fail("Oyuncu listesi ekranı kayboldu")
+            val before = Ocr.counter(cap.lines, cap.h) ?: return fail("n/20 sayacı okunamadı; seçim yapılmadı")
+            if (before >= 20) return fail("Sayaç zaten 20/20")
+
+            val rows = Ocr.rows(cap.lines).mapNotNull { row -> Parser.row(row.text, row.y) }
+            // First use the full-row parser; then use target-guided OCR line clustering
+            // for OSM layouts where name/age and stat cells are emitted as separate lines.
+            val parsedMatches = Matcher.match(p, rows)
+            val fallbackMatches = Matcher.matchOcr(p, cap.lines, cap.h)
+            val matches = (parsedMatches + fallbackMatches).distinctBy { it.y / 24 }
+            if (matches.size > 1) return fail("Birden fazla eşleşme var: ${p.name}. Yanlış oyuncu eklenmedi.")
+            if (matches.size == 1) {
+                val row = matches.single()
+                if (!tapPlusForRow(cap, row.y)) return fail("${p.name} satırının + düğmesi bulunamadı")
+                delay(waitMs)
+                val afterCap = capture() ?: return fail("Ekleme sonrası ekran okunamadı")
+                val after = Ocr.counter(afterCap.lines, afterCap.h)
+                if (after != before + 1) return fail("${p.name} eklemesi sayaçla doğrulanamadı ($before → $after). Durdum.")
+                done.add(p.key); save(); render("✔ ${p.name} eklendi ve sayaç doğrulandı")
+                if (!returnToCorrectRosterScreen(p)) return fail("Oyuncu eklendi ancak sonraki yuva için saha/yedek ekranı doğrulanamadı.")
+                return true
+            }
+
+            if (searchTries < retries) {
+                searchTries++
+                if (!replaceSearchText(p.name)) return fail("Arama yenilenemedi: ${p.name}")
+                delay(waitMs)
+                continue
+            }
+            val signature = rows.joinToString("|") { "${it.name}:${it.age}:${it.pos}" }
+            if (signature == lastSig || ++scrolls > 30) {
+                val nearby = cap.lines.sortedBy { kotlin.math.abs(it.box.centerY() - cap.h * 0.44f) }
+                    .take(14).joinToString(" | ") { it.text }
+                return fail("Tam eşleşme bulunamadı: ${p.name} (${p.age}, ${p.pos}). OCR satırları: $nearby. Yanlış oyuncu eklenmedi.")
+            }
+            lastSig = signature
+            if (!gesture(Path().apply { moveTo(cap.w * 0.52f, cap.h * 0.80f); lineTo(cap.w * 0.52f, cap.h * 0.42f) }, 420)) {
+                return fail("Oyuncu listesi kaydırılamadı")
+            }
+            delay(650)
+        }
+    }
+
+    private suspend fun ensureSearchField(name: String): Boolean {
+        if (findEditable() == null) {
+            val cap = capture() ?: return false
+            if (!tapSearchControl(cap)) return false
+            delay(350)
+        }
+        return replaceSearchText(name)
+    }
+
+    private suspend fun replaceSearchText(name: String): Boolean {
+        for (attempt in 0..retries) {
+            val node = findEditable()
+            if (node != null) {
+                node.performAction(AccessibilityNodeInfo.ACTION_FOCUS)
+                node.performAction(AccessibilityNodeInfo.ACTION_CLICK)
+                delay(200)
+                val args = Bundle().apply {
+                    putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, name)
+                }
+                val ok = node.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args)
+                delay(250)
+                node.refresh()
+                val currentText = node.text?.toString()?.trim()
+                if (ok && currentText.equals(name, ignoreCase = true)) {
+                    node.performAction(AccessibilityNodeInfo.AccessibilityAction.ACTION_IME_ENTER.id)
+                    return true
+                }
+            }
+            delay(waitMs)
+        }
+        return false
+    }
+
+    private fun clearSearch() {
+        val node = findEditable() ?: return
+        val args = Bundle().apply { putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, "") }
+        node.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args)
+    }
+
+    private fun findEditable(): AccessibilityNodeInfo? {
+        val root = rootInActiveWindow ?: return null
+        var found: AccessibilityNodeInfo? = null
+        fun walk(node: AccessibilityNodeInfo?) {
+            if (node == null || found != null) return
+            if (node.isVisibleToUser && (node.isEditable || node.className?.toString()?.contains("EditText") == true)) {
+                found = node; return
+            }
+            for (i in 0 until node.childCount) walk(node.getChild(i))
+        }
+        walk(root)
+        return found
+    }
+
+    private fun tapSearchControl(cap: Cap): Boolean {
+        if (tapNamedNode(listOf("ara", "search", "oyuncu ara", "player search"))) return true
+        val line = cap.lines.firstOrNull {
+            val n = Matcher.n(it.text)
+            n == "ara" || n == "search" || n.contains("oyuncuara") || n.contains("playersearch")
+        } ?: return false
+        return dispatchTap(line.box.centerX().toFloat(), line.box.centerY().toFloat())
+    }
+
+    private fun tapPlusForRow(cap: Cap, rowY: Int): Boolean {
+        val root = rootInActiveWindow
+        var point: Pair<Float, Float>? = null
+        fun walk(node: AccessibilityNodeInfo?) {
+            if (node == null || point != null) return
+            val label = Matcher.n(node.text?.toString().orEmpty() + " " + node.contentDescription?.toString().orEmpty())
+            if (node.isVisibleToUser && node.isClickable &&
+                (label == "ekle" || label == "add" || label == "plus" || label == "＋" || label == "+")) {
+                val b = Rect(); node.getBoundsInScreen(b)
+                if (kotlin.math.abs(b.centerY() - rowY) < max(70, cap.h / 25)) point = b.centerX().toFloat() to b.centerY().toFloat()
+            }
+            for (i in 0 until node.childCount) walk(node.getChild(i))
+        }
+        walk(root)
+        val p = point
+        return if (p != null) dispatchTap(p.first, p.second)
+        else dispatchTap(cap.w * plusX, rowY.toFloat()) // son çare: kalibre edilmiş ekran oranı
+    }
+
+    private fun tapNamedNode(names: List<String>): Boolean {
+        val root = rootInActiveWindow ?: return false
+        var target: AccessibilityNodeInfo? = null
+        fun walk(node: AccessibilityNodeInfo?) {
+            if (node == null || target != null) return
+            val value = Matcher.n(node.text?.toString().orEmpty() + " " + node.contentDescription?.toString().orEmpty())
+            if (node.isVisibleToUser && names.any { value.contains(Matcher.n(it)) }) {
+                var candidate: AccessibilityNodeInfo? = node
+                var depth = 0
+                while (candidate != null && depth < 5) {
+                    if (candidate.isVisibleToUser && candidate.isClickable) { target = candidate; break }
+                    candidate = candidate.parent
+                    depth++
+                }
+                if (target != null) return
+            }
+            for (i in 0 until node.childCount) walk(node.getChild(i))
+        }
+        walk(root)
+        return target?.performAction(AccessibilityNodeInfo.ACTION_CLICK) == true
+    }
+
+    private fun dispatchTap(x: Float, y: Float): Boolean =
+        dispatchGesture(GestureDescription.Builder().addStroke(
+            GestureDescription.StrokeDescription(Path().apply { moveTo(x, y) }, 0, 60)
+        ).build(), null, null)
+
+    /** Ekrandaki en büyük yeşil saha benzeri alanın sınırını örneklemeyle bulur. */
+    private fun detectPitchBounds(bitmap: Bitmap): Rect? {
+        val w = bitmap.width; val h = bitmap.height
+        val step = max(2, min(w, h) / 220)
+        val rowCount = IntArray(h / step + 1)
+        val colCount = IntArray(w / step + 1)
+        var total = 0
+        var y = (h * 0.08f).toInt()
+        while (y < h * 0.96f) {
+            var x = (w * 0.03f).toInt()
+            while (x < w * 0.97f) {
+                val c = bitmap.getPixel(x, y)
+                val r = (c shr 16) and 0xff; val g = (c shr 8) and 0xff; val b = c and 0xff
+                if (g > 55 && g > r * 1.12 && g > b * 1.05) {
+                    rowCount[y / step]++; colCount[x / step]++; total++
+                }
+                x += step
+            }
+            y += step
+        }
+        if (total < (w / step) * (h / step) * 0.035) return null
+        val minRow = rowCount.indices.firstOrNull { rowCount[it] > (w / step) * 0.22 } ?: return null
+        val maxRow = rowCount.indices.reversed().firstOrNull { rowCount[it] > (w / step) * 0.22 } ?: return null
+        val minCol = colCount.indices.firstOrNull { colCount[it] > (h / step) * 0.12 } ?: return null
+        val maxCol = colCount.indices.reversed().firstOrNull { colCount[it] > (h / step) * 0.12 } ?: return null
+        val rect = Rect(minCol * step, minRow * step, min(w, (maxCol + 1) * step), min(h, (maxRow + 1) * step))
+        if (rect.width() < w * 0.45 || rect.height() < h * 0.22) return null
+        return rect
+    }
+
+    private fun kbVisible(): Boolean = windows.any { it.type == AccessibilityWindowInfo.TYPE_INPUT_METHOD }
+
+    private fun diagnose() {
+        val root = rootInActiveWindow
+        if (root == null) { render("TANI: aktif pencere okunamadı"); return }
+        var nodes = 0; var edits = 0; var clicks = 0
+        val out = StringBuilder()
+        fun walk(node: AccessibilityNodeInfo?, depth: Int) {
+            if (node == null || nodes > 2500) return
+            nodes++
+            val editable = node.isEditable || node.className?.toString()?.contains("EditText") == true
+            if (editable) edits++
+            if (node.isClickable) clicks++
+            val text = node.text?.toString() ?: node.contentDescription?.toString()
+            if ((editable || text != null) && out.length < 3500) {
+                val bounds = Rect(); node.getBoundsInScreen(bounds)
+                out.append("  ".repeat(depth.coerceAtMost(8)))
+                    .append(node.className?.toString()?.substringAfterLast('.'))
+                    .append(if (editable) " [EDIT]" else "")
+                    .append(if (node.isClickable) " [CLICK]" else "")
+                    .append(" [${bounds.left},${bounds.top},${bounds.right},${bounds.bottom}]: ")
+                    .append(text.orEmpty()).append('\n')
+            }
+            for (i in 0 until node.childCount) walk(node.getChild(i), depth + 1)
+        }
+        walk(root, 0)
+        val summary = "pkg=${root.packageName} node=$nodes editable=$edits clickable=$clicks keyboard=${kbVisible()}"
+        val clipboard = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+        clipboard.setPrimaryClip(ClipData.newPlainText("OSM TANI", summary + "\n" + out))
+        render("TANI: $summary\nAyrıntılar panoya kopyalandı.")
+    }
+
+    private suspend fun gesture(path: Path, duration: Long): Boolean = suspendCancellableCoroutine { cont ->
+        val gesture = GestureDescription.Builder()
+            .addStroke(GestureDescription.StrokeDescription(path, 0, duration)).build()
+        val accepted = dispatchGesture(gesture, object : AccessibilityService.GestureResultCallback() {
+            override fun onCompleted(gestureDescription: GestureDescription?) { if (cont.isActive) cont.resume(true) }
+            override fun onCancelled(gestureDescription: GestureDescription?) { if (cont.isActive) cont.resume(false) }
+        }, null)
+        if (!accepted && cont.isActive) cont.resume(false)
+    }
+
+    private suspend fun capture(): Cap? {
+        val wait = 1100 - (System.currentTimeMillis() - lastShot)
+        if (wait > 0) delay(wait)
+        panel?.visibility = View.INVISIBLE
+        delay(100)
+        val bitmap: Bitmap? = try {
+            suspendCancellableCoroutine { cont ->
+                takeScreenshot(Display.DEFAULT_DISPLAY, mainExecutor, object : AccessibilityService.TakeScreenshotCallback {
+                    override fun onSuccess(result: AccessibilityService.ScreenshotResult) {
+                        val buffer = result.hardwareBuffer
+                        val copied = Bitmap.wrapHardwareBuffer(buffer, result.colorSpace)?.copy(Bitmap.Config.ARGB_8888, false)
+                        buffer.close()
+                        if (cont.isActive) cont.resume(copied)
+                    }
+                    override fun onFailure(errorCode: Int) { if (cont.isActive) cont.resume(null) }
+                })
+            }
+        } finally {
+            panel?.visibility = View.VISIBLE
+            lastShot = System.currentTimeMillis()
+        }
+        if (bitmap == null) return null
+        val lines = Ocr.lines(bitmap) ?: return null
+        return Cap(lines, bitmap)
+    }
+}
+
+=== FILE: app/src/main/java/app/osmsquad/Parser.kt ===
+package app.osmsquad
+
+import java.util.Locale
+
+data class Row(val name: String, val age: Int, val club: String, val pos: String,
+               val h: Int, val d: Int, val o: Int, val y: Int = 0)
+
+/** Web uygulamasındaki OCR ayrıştırıcının (parseOCR) Kotlin karşılığı; tek bir satır metnini çözer. */
+object Parser {
+    private val RX = Regex("""([^\d()]+?)\s*\((\d{1,2})\)\s*([^()]+?)\s+([A-ZĞÖÜİŞÇ0]{1,3})\s+(\d{1,3})\s+(\d{1,3})\s+(\d{1,3})""")
+    private val LEAD = Regex("^[^A-Za-zÀ-ÿĞğİıŞşÇçÖöÜü]+")
+    private val WS = Regex("\\s+")
+
+    fun pos(t: String): String = t.uppercase(Locale("tr")).replace('0', 'O')
+        .replace("SGA", "SĞA").replace("SGK", "SĞK").replace("SGB", "SĞB")
+
+    fun row(text: String, y: Int): Row? {
+        val m = RX.find(text) ?: return null
+        val g = m.groupValues
+        val name = g[1].replace(LEAD, "").replace(WS, " ").trim()
+        return Row(name, g[2].toInt(), g[3].replace(WS, " ").trim(), pos(g[4]),
+            g[5].toInt(), g[6].toInt(), g[7].toInt(), y)
+    }
+}
+
+=== FILE: app/src/main/java/app/osmsquad/SquadState.kt ===
+package app.osmsquad
+
+import android.content.Context
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateMapOf
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.setValue
+import org.json.JSONArray
+import org.json.JSONObject
+import java.text.Normalizer
+
+fun fold(s: String): String = Normalizer.normalize(s.replace('ı', 'i').replace('İ', 'I'), Normalizer.Form.NFD)
+    .replace(Regex("\\p{M}"), "").lowercase().replace(Regex("[^a-z0-9]"), "")
+
+/** Kadro verisi cihazda saklanır. Otomasyon paylaşımı ayrı bir sözleşmeye dönüştürülür. */
+class SquadState(private val ctx: Context) {
+    private val prefs = ctx.getSharedPreferences("osm_squad", Context.MODE_PRIVATE)
+
+    var formationId by mutableStateOf<String?>(null)
+    var target by mutableStateOf(80)
+    val players = mutableStateMapOf<String, Pl>()
+    val done = mutableStateMapOf<String, String>()
+
+    init { prefs.getString("json", null)?.let { fromJson(it) } }
+    val formation: Formation? get() = Formations.all.find { it.id == formationId }
+    fun slotById(id: String): Slot? = formation?.slots?.find { it.id == id } ?: Formations.SUBS.find { it.id == id }
+
+    fun setFormation(id: String) {
+        if (formationId != id) {
+            players.keys.filter { it.startsWith("xi") }.toList().forEach { players.remove(it); done.remove(it) }
+        }
+        formationId = id
+        persist()
+    }
+
+    fun updateTarget(v: Int) { target = v.coerceIn(1, 100); persist() }
+
+    fun defaultPosition(slot: Slot): String = if (slot.id.startsWith("xi")) slot.label else when (slot.group) {
+        "GK" -> "KL"; "DF" -> "STP"; "MD" -> "OS"; else -> "SF"
+    }
+
+    fun put(id: String, p: Pl): String? {
+        val slot = slotById(id) ?: return "Bilinmeyen kadro yuvası"
+        if (p.name.isBlank()) return "Oyuncu adı gerekli"
+        if (p.age !in 1..60 || p.rating !in 1..100) return "Yaş veya reyting geçersiz"
+        val pos = if (slot.id.startsWith("xi")) slot.label else p.pos.ifBlank { defaultPosition(slot) }
+        if (Formations.groupOfPosition(pos) != slot.group) return "${slot.label} için $pos pozisyonu uygun değil"
+        val other = players.entries.firstOrNull { it.key != id && fold(it.value.name) == fold(p.name) }
+        if (other != null) return "Bu oyuncu zaten kadroda (${slotById(other.key)?.label ?: other.key})"
+        if (!players.containsKey(id) && players.size >= 20) return "Kadro 20/20: önce bir oyuncu sil"
+        players[id] = p.copy(name = p.name.trim(), pos = pos)
+        persist()
+        return null
+    }
+
+    fun remove(id: String) { players.remove(id); done.remove(id); persist() }
+    fun toggle(id: String, status: String) {
+        if (done[id] == status) done.remove(id) else done[id] = status
+        persist()
+    }
+    fun resetProgress() { done.clear(); persist() }
+
+    fun orderedSlots(): List<Slot> =
+        (formation?.slots ?: emptyList()).sortedBy { Formations.GROUP_ORDER.indexOf(it.group) } + Formations.SUBS
+
+    fun missingLabels(): List<String> = orderedSlots().filter { !players.containsKey(it.id) }.map { it.label }
+
+    /** İş kurallarını sadece uyarı olarak değil, otomasyon öncesinde engelleyici doğrulama olarak uygular. */
+    fun validationErrors(): List<String> {
+        val errors = mutableListOf<String>()
+        val f = formation
+        if (f == null) return listOf("Önce 4-3-3A veya 5-2-3A dizilişini seç")
+        if (target !in 1..100) errors += "Hedef reyting 1-100 olmalı"
+        val missing = missingLabels()
+        if (missing.isNotEmpty()) errors += "Eksik yuvalar: ${missing.joinToString()}"
+        if (players.size != 20) errors += "Toplam oyuncu 20 olmalı (${players.size}/20)"
+        if (players.values.map { fold(it.name) }.toSet().size != players.size) errors += "Aynı oyuncu birden fazla kez kullanılmış"
+
+        f.slots.forEach { slot ->
+            val p = players[slot.id] ?: return@forEach
+            if (p.rating != target) errors += "${slot.label} · ${p.name}: ilk 11 reytingi $target olmalı"
+            if (slot.label != "OS" && p.age !in 20..29) errors += "${slot.label} · ${p.name}: yaş 20-29 olmalı"
+            if (p.pos != slot.label) errors += "${slot.label} yuvasında ${p.pos} pozisyonlu oyuncu var"
+        }
+        val osPlayers = f.slots.filter { it.label == "OS" }.mapNotNull { players[it.id] }
+        if (osPlayers.size == 2 && (osPlayers.count { it.age in 20..29 } != 1 || osPlayers.count { it.age >= 31 } != 1)) {
+            errors += "İki OS oyuncusundan biri 20-29, diğeri 31+ yaşında olmalı"
+        }
+
+        Formations.SUBS.forEach { slot ->
+            val p = players[slot.id] ?: return@forEach
+            if (Formations.groupOfPosition(p.pos) != slot.group) errors += "${slot.label}: pozisyon grubu uyumsuz"
+            if (p.priority) {
+                if (p.rating < target) errors += "${p.name}: öncelikli yedek reytingi en az $target olmalı"
+                if (p.age !in 20..29) errors += "${p.name}: öncelikli yedek yaşı 20-29 olmalı"
+            } else {
+                if (p.rating < 50) errors += "${p.name}: normal yedek reytingi en az 50 olmalı"
+                if (p.age !in 15..50) errors += "${p.name}: normal yedek yaşı 15-50 olmalı"
+            }
+            if (p.pos == "SĞA" && p.rating == target) errors += "Hedef reytingli SĞA yedek olamaz: ${p.name}"
+        }
+        return errors.distinct()
+    }
+
+    fun warnings(): Map<String, String> {
+        val errors = validationErrors()
+        if (errors.isEmpty()) return emptyMap()
+        val result = linkedMapOf<String, String>()
+        for (slot in orderedSlots()) {
+            val p = players[slot.id] ?: continue
+            val own = errors.filter { it.contains(p.name) || it.contains(slot.label) }
+            if (own.isNotEmpty()) result[slot.id] = own.joinToString("; ")
+        }
+        return result
+    }
+
+    /** UI'nin kayıt formatı; eski version 2 kadroları da içe aktarılır. */
+    fun toJson(): String {
+        val o = JSONObject().put("version", 3).put("formation", formationId ?: JSONObject.NULL).put("target", target)
+        val po = JSONObject()
+        for ((k, v) in players) po.put(k, JSONObject().put("n", v.name).put("a", v.age).put("r", v.rating)
+            .put("p", v.pos).put("priority", v.priority))
+        o.put("players", po)
+        val d = JSONObject(); for ((k, v) in done) d.put(k, v)
+        o.put("done", d)
+        return o.toString()
+    }
+
+    /** Otomasyon servisine version 1 veri sözleşmesi gönderir. */
+    fun automationJson(): String {
+        val f = formation ?: throw IllegalStateException("Diziliş seçilmedi")
+        val ordered = orderedSlots()
+        val arr = JSONArray()
+        ordered.forEachIndexed { index, slot ->
+            val p = players[slot.id] ?: throw IllegalStateException("Eksik: ${slot.label}")
+            val role = if (slot.id.startsWith("xi")) "XI" else "SUB"
+            val col = when (p.pos) { "KL" -> "k"; "SLB", "STP", "SĞB" -> "d"; "OS", "OOS" -> "o"; else -> "h" }
+            arr.put(JSONObject().put("role", role).put("slot", slot.id).put("order", index)
+                .put("name", p.name).put("age", p.age).put("club", "").put("pos", p.pos)
+                .put("rating", p.rating).put("col", col).put("priority", p.priority))
+        }
+        return JSONObject().put("version", 1).put("formation", f.id).put("target", target).put("players", arr).toString()
+    }
+
+    /** Tüm kontroller geçerse AccessibilityService'in okuyacağı ayarı hazırlar. */
+    fun prepareAutomation(purchaseRiskAcknowledged: Boolean): List<String> {
+        if (!purchaseRiskAcknowledged) return listOf("Bütçe kontrolü henüz uygulanmadı. + düğmesinin satın alma yapabileceğini onaylamalısın.")
+        val errors = validationErrors()
+        if (errors.isNotEmpty()) return errors
+        val autoJson = automationJson()
+        ctx.getSharedPreferences("osm", Context.MODE_PRIVATE).edit()
+            .putString("squad", autoJson).putString("done", "[]")
+            .putString("pkg", "com.gamebasics.osm").putBoolean("allowPurchase", true).apply()
+        done.clear()
+        persist()
+        return emptyList()
+    }
+
+    fun fromJson(s: String): String? {
+        return try {
+            val o = JSONObject(s)
+            val version = o.optInt("version")
+            if (version != 2 && version != 3) return "Desteklenmeyen sürüm (version 2/3 bekleniyor)"
+            val fid = if (o.isNull("formation")) null else o.getString("formation")
+            if (fid != null && Formations.all.none { it.id == fid }) return "Bilinmeyen diziliş: $fid"
+            val valid = (Formations.all.firstOrNull { it.id == fid }?.slots?.map { it.id } ?: emptyList()) + Formations.SUBS.map { it.id }
+            val po = o.getJSONObject("players")
+            val tmp = linkedMapOf<String, Pl>()
+            val names = hashSetOf<String>()
+            for (k in po.keys()) {
+                if (k !in valid) return "Geçersiz yuva: $k"
+                val q = po.getJSONObject(k)
+                val slot = (Formations.all.firstOrNull { it.id == fid }?.slots?.find { it.id == k } ?: Formations.SUBS.find { it.id == k })
+                    ?: return "Yuva bulunamadı: $k"
+                val p = Pl(q.getString("n").trim(), q.getInt("a"), q.getInt("r"),
+                    q.optString("p", defaultPosition(slot)).ifBlank { defaultPosition(slot) }, q.optBoolean("priority", false))
+                if (p.name.isEmpty()) return "Boş isim: $k"
+                if (p.rating !in 1..100) return "Reyting 1-100 olmalı: ${p.name}"
+                if (p.age !in 1..60) return "Yaş 1-60 olmalı: ${p.name}"
+                if (Formations.groupOfPosition(p.pos) != slot.group) return "Pozisyon grubu uyumsuz: ${p.name}"
+                if (!names.add(fold(p.name))) return "Tekrarlanan oyuncu: ${p.name}"
+                tmp[k] = p
+            }
+            if (tmp.size > 20) return "20'den fazla oyuncu"
+            val tmpDone = linkedMapOf<String, String>()
+            o.optJSONObject("done")?.let { d ->
+                for (k in d.keys()) {
+                    val v = d.getString(k)
+                    if (tmp.containsKey(k) && (v == "added" || v == "skipped")) tmpDone[k] = v
+                }
+            }
+            formationId = fid
+            target = o.optInt("target", 80).coerceIn(1, 100)
+            players.clear(); players.putAll(tmp)
+            done.clear(); done.putAll(tmpDone)
+            persist()
+            null
+        } catch (e: Exception) { "JSON okunamadı: ${e.message}" }
+    }
+
+    private fun persist() { prefs.edit().putString("json", toJson()).apply() }
+}
+
+=== FILE: app/src/main/res/values/strings.xml ===
+<resources>
+    <string name="service_desc">Yalnızca sen BAŞLAT düğmesine bastığında OSM ekranını tanımak, oyuncu bilgilerini kontrol etmek ve kadro ekleme adımlarını yürütmek için ekran görüntüsü ve dokunma erişimi kullanır. Parola okumaz.</string>
+</resources>
+
+=== FILE: app/src/main/res/xml/accessibility_config.xml ===
+<?xml version="1.0" encoding="utf-8"?>
+<accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
+    android:accessibilityEventTypes="typeWindowStateChanged|typeWindowContentChanged|typeViewFocused"
+    android:accessibilityFeedbackType="feedbackGeneric"
+    android:accessibilityFlags="flagDefault|flagRetrieveInteractiveWindows|flagReportViewIds"
+    android:canPerformGestures="true"
+    android:canTakeScreenshot="true"
+    android:canRetrieveWindowContent="true"
+    android:notificationTimeout="200"
+    android:description="@string/service_desc" />
+
+=== FILE: build.gradle.kts ===
+plugins {
+    id("com.android.application") version "8.5.2" apply false
+    id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+}
+
+=== FILE: gradle.properties ===
+org.gradle.jvmargs=-Xmx2g
+android.useAndroidX=true
+kotlin.code.style=official
+
+=== FILE: settings.gradle.kts ===
+pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
+dependencyResolutionManagement {
+    repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+    repositories { google(); mavenCentral() }
+}
+rootProject.name = "OsmSquad"
+include(":app")
+
