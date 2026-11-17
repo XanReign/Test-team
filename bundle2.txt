@@ -20,6 +20,22 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Unpack bundle2.txt when present
+        run: |
+          if [ -f bundle2.txt ]; then
+            python3 - <<'PYBUNDLE'
+          import os, re
+          text = open('bundle2.txt', encoding='utf-8').read()
+          parts = re.split(r'^=== FILE: (.+?) ===\r?\n', text, flags=re.M)
+          for i in range(1, len(parts), 2):
+              path = parts[i].strip()
+              os.makedirs(os.path.dirname(path) or '.', exist_ok=True)
+              with open(path, 'w', encoding='utf-8', newline='\n') as f:
+                  f.write(parts[i + 1].replace('\r\n', '\n'))
+          print('Unpacked', (len(parts) - 1) // 2, 'project files')
+          PYBUNDLE
+          fi
+
       - name: Set up Java
         uses: actions/setup-java@v4
         with:
@@ -67,7 +83,8 @@ This project combines the Compose roster editor from `bundle2.txt` with the OCR 
   - A target-rated SĞA cannot be a substitute.
 - Automation handoff from the Compose roster to the AccessibilityService.
 - Floating controls: BAŞLAT, DURAKLAT, DEVAM, DURDUR and TANI.
-- OCR-based category selection and player-row matching with name, age, position and available rating columns; duplicate matches or failed counter verification stop the run.
+- After a pitch slot is selected, the service recognizes the category chooser and taps the blue + button inside the matching category row (Forvetler, Orta sahalar, Defanslar or Kaleciler). It does not tap the category heading itself. It then opens the player list/search step.
+- OCR-based player-row matching checks name, age, position and available rating columns; duplicate matches or failed counter verification stop the run.
 - For starting-XI slots, the service attempts to detect the green pitch area and maps the saved formation position into that area. If the pitch cannot be detected, it stops without tapping.
 - For substitute slots, the service only proceeds when the Yedekler tab and the named slot are available through the Android accessibility tree. It does not guess substitute coordinates.
 
@@ -96,7 +113,7 @@ The repository does not include a Gradle wrapper binary. The workflow creates th
 - There is not yet a verified transfer-price / available-budget parser. Do not run unattended with a valuable in-game budget until the budget guard is implemented and verified.
 - Any player row with more than one strict candidate, a missing category, an unreadable counter, or an unverified add is treated as an error and stops the run.
 
-This is an integrated development build, not a claim that all screen-specific automation is finished or field-tested.
+The category + selection fix is based on the supplied OSM screenshot and still needs to be confirmed on the installed OSM version. This is an integrated development build, not a claim that all screen-specific automation is finished or field-tested.
 
 === FILE: app/build.gradle.kts ===
 plugins {
@@ -111,8 +128,8 @@ android {
         applicationId = "app.osmsquad"
         minSdk = 30
         targetSdk = 34
-        versionCode = 2
-        versionName = "0.2.0"
+        versionCode = 3
+        versionName = "0.3.0"
     }
     buildFeatures { compose = true }
     composeOptions { kotlinCompilerExtensionVersion = "1.5.14" }
@@ -835,9 +852,35 @@ object Ocr {
         return CNT.find(top)?.groupValues?.get(1)?.toInt()
     }
 
+    /**
+     * Pitch slotuna dokununca açılan kategori seçme ekranı; dört grup başlığını
+     * aynı anda gösterir ve her grubun satırında ayrı bir mavi + düğmesi bulunur.
+     * Bu ekran oyuncu arama sonuçlarıyla karıştırılmamalıdır.
+     */
+    fun isCategoryChooser(ls: List<Ln>): Boolean {
+        val groups = ls.mapNotNull { categoryGroup(it.text) }.toSet()
+        return groups.size >= 2
+    }
+
+    private fun categoryGroup(text: String): String? {
+        val t = Matcher.n(text)
+        return when {
+            t.contains("kaleci") || t.contains("goalkeeper") -> "GK"
+            t.contains("defans") || t.contains("defender") -> "DF"
+            t.contains("ortasaha") || t.contains("midfielder") -> "MD"
+            t.contains("forvet") || t.contains("forward") || t.contains("attacker") -> "FW"
+            else -> null
+        }
+    }
+
+    /** Kategori seçme ekranı hariç, OSM oyuncu tablosunun başlıklarını tanır. */
     fun isList(ls: List<Ln>): Boolean {
-        val t = ls.joinToString(" ") { it.text }
-        return t.contains("Fiyat") && t.contains("Oyuncu")
+        if (ls.isEmpty() || isCategoryChooser(ls)) return false
+        val t = Matcher.n(ls.joinToString(" ") { it.text })
+        val hasPrice = t.contains("fiyat") || t.contains("price")
+        val hasPositionColumn = t.contains("poz") || t.contains("position")
+        val hasNationalityColumn = t.contains("uyr") || t.contains("nationality")
+        return hasPrice && (hasPositionColumn || hasNationalityColumn)
     }
 }
 
@@ -1003,7 +1046,7 @@ class OsmService : AccessibilityService() {
             currentCoroutineContext().ensureActive()
             if (p.key in done) continue
             current = "${p.name} (${p.slot} · ${p.pos})"
-            render("Pozisyon ve kategori aranıyor…")
+            render("Boş mevki → kategori + → oyuncu arama…")
             if (!preparePlayerList(p)) return
             if (!stepInList(p)) return
         }
@@ -1013,51 +1056,81 @@ class OsmService : AccessibilityService() {
         render(if (count == 20) "20/20 sayaç doğrulandı." else "20 oyuncu işlendi; son sayaç doğrulanamadı ($count). Ekranı kontrol et.")
     }
 
-    /** Oyuncu listesi açık değilse önce ilgili boş yuvayı, sonra doğru oyuncu kategorisini seçer. */
+    /**
+     * OSM akışı: saha/yedek yuvasına dokun → kategori ekranında ilgili satırın
+     * mavi + düğmesine dokun → oyuncu arama ekranını aç.
+     * Kategori başlığının kendisine dokunulmaz; her kategori için ayrı + vardır.
+     */
     private suspend fun preparePlayerList(p: AutoPlayer): Boolean {
         var cap = capture() ?: return fail("Ekran görüntüsü alınamadı")
         if (fgPkg() != targetPkg) return fail("OSM ön planda değil")
-        if (Ocr.isList(cap.lines)) return fail("Başlangıçta oyuncu listesi açık. Önce OSM saha/kadro ekranına dön, sonra BAŞLAT.")
 
-        val group = Formations.groupOfPosition(p.pos) ?: return fail("Pozisyon grubu tanınmadı: ${p.pos}")
-        if (p.slot.startsWith("xi")) {
-            val formation = Formations.all.firstOrNull { it.id == squad?.formation }
-                ?: return fail("Diziliş tanınmıyor")
-            val slot = formation.slots.firstOrNull { it.id == p.slot }
-                ?: return fail("Saha yuvası bulunamadı: ${p.slot}")
-            val rect = detectPitchBounds(cap.bitmap)
-                ?: return fail("Saha alanı güvenilir biçimde algılanamadı. Dokunma yapılmadı.")
-            val x = rect.left + rect.width() * (slot.x / 100f)
-            val y = rect.top + rect.height() * (slot.y / 100f)
-            if (x !in 0f..cap.w.toFloat() || y !in 0f..cap.h.toFloat()) return fail("Saha koordinatı ekran dışında")
-            render("${slot.label} saha yuvası seçiliyor…")
-            if (!gesture(Path().apply { moveTo(x, y) }, 70)) return fail("Saha yuvasına dokunulamadı")
-        } else {
-            // Yedek kartları sürüme göre değiştiğinden önce Yedekler sekmesini bul,
-            // sonra sadece metni erişilebilir olan yuvaya dokun.
-            if (!tapNamedNode(listOf("yedekler", "subs", "bench"))) {
-                return fail("Yedekler sekmesi tanınmadı; yanlış ekrana dokunmamak için durdum.")
+        val group = Formations.groupOfPosition(p.pos)
+            ?: return fail("Pozisyon grubu tanınmadı: ${p.pos}")
+        var chooserOpen = Ocr.isCategoryChooser(cap.lines)
+        var resultsOpen = Ocr.isList(cap.lines)
+
+        // DEVAM'a basıldığında arama listesi veya kategori seçimi zaten açıksa,
+        // aynı yuvaya tekrar dokunmadan mevcut adımdan devam et.
+        if (!chooserOpen && !resultsOpen && findEditable() != null) resultsOpen = true
+
+        if (!chooserOpen && !resultsOpen) {
+            if (p.slot.startsWith("xi")) {
+                val formation = Formations.all.firstOrNull { it.id == squad?.formation }
+                    ?: return fail("Diziliş tanınmıyor")
+                val slot = formation.slots.firstOrNull { it.id == p.slot }
+                    ?: return fail("Saha yuvası bulunamadı: ${p.slot}")
+                val rect = detectPitchBounds(cap.bitmap)
+                    ?: return fail("Saha alanı güvenilir biçimde algılanamadı. Dokunma yapılmadı.")
+                val x = rect.left + rect.width() * (slot.x / 100f)
+                val y = rect.top + rect.height() * (slot.y / 100f)
+                if (x !in 0f..cap.w.toFloat() || y !in 0f..cap.h.toFloat()) {
+                    return fail("Saha koordinatı ekran dışında")
+                }
+                render("${slot.label} saha yuvası seçiliyor…")
+                if (!gesture(Path().apply { moveTo(x, y) }, 70)) {
+                    return fail("Saha yuvasına dokunulamadı")
+                }
+            } else {
+                // Yedek yuvası seçimi: önce yedek alanını aç, sonra istenen boş yuvayı seç.
+                if (!tapNamedNode(listOf("yedekler", "subs", "bench"))) {
+                    return fail("Yedekler sekmesi tanınmadı; yanlış ekrana dokunmadım.")
+                }
+                delay(waitMs)
+                if (!tapNamedNode(listOf(p.slot, subLabel(p.slot)))) {
+                    return fail("${p.slot} yedek yuvası bulunamadı.")
+                }
             }
             delay(waitMs)
-            if (!tapNamedNode(listOf(p.slot, subLabel(p.slot)))) {
-                return fail("${p.slot} yedek yuvası erişilebilir metinle bulunamadı. Yanlış yedeğe dokunmamak için durdum.")
+            cap = capture() ?: return fail("Mevki seçildikten sonra ekran okunamadı")
+            chooserOpen = Ocr.isCategoryChooser(cap.lines)
+            resultsOpen = Ocr.isList(cap.lines)
+        }
+
+        if (chooserOpen) {
+            render("${Formations.GROUP_NAME[group]} kategorisinin + düğmesi seçiliyor…")
+            if (!tapCategoryPlus(cap, group)) {
+                return fail("${Formations.GROUP_NAME[group]} satırındaki + düğmesi bulunamadı; yanlış kategoriye dokunmadım.")
             }
-        }
-        delay(waitMs)
-        cap = capture() ?: return fail("Yuva seçildikten sonra ekran okunamadı")
-        if (Ocr.isList(cap.lines)) return true
-        if (!tapCategoryIfVisible(cap, group)) {
-            return fail("${Formations.GROUP_NAME[group]} kategorisi ekranda doğrulanamadı. Yanlış yere dokunmadım.")
-        }
-        delay(waitMs)
-        cap = capture() ?: return fail("Kategori seçildikten sonra ekran okunamadı")
-        if (!Ocr.isList(cap.lines)) {
-            // Arama alanı erişilebilir ama liste başlığı OCR'da görünmeyebilir.
-            if (findEditable() == null && !tapSearchControl(cap)) return fail("Oyuncu listesi veya arama alanı tanınmadı")
             delay(waitMs)
-            cap = capture() ?: return fail("Oyuncu listesi okunamadı")
+            cap = capture() ?: return fail("Kategori + düğmesinden sonra ekran okunamadı")
+            if (Ocr.isCategoryChooser(cap.lines)) {
+                return fail("${Formations.GROUP_NAME[group]} + düğmesine basıldı ancak kategori ekranı kapanmadı.")
+            }
+            resultsOpen = Ocr.isList(cap.lines)
         }
-        if (!Ocr.isList(cap.lines)) return fail("Oyuncu listesi ekranı doğrulanamadı")
+
+        if (!resultsOpen && findEditable() == null) {
+            // Bazı OSM sürümlerinde + düğmesi önce listeyi açar, arama alanı
+            // ayrıca büyüteç düğmesiyle görünür hâle gelir.
+            if (!tapSearchControl(cap)) return fail("Kategori seçildi ancak oyuncu arama ekranı doğrulanamadı")
+            delay(waitMs)
+            cap = capture() ?: return fail("Arama ekranı okunamadı")
+        }
+
+        if (!Ocr.isList(cap.lines) && findEditable() == null) {
+            return fail("Oyuncu listesi açılmadı; isim aramasına geçmedim.")
+        }
         return true
     }
 
@@ -1099,20 +1172,113 @@ class OsmService : AccessibilityService() {
         else -> slot
     }
 
-    private fun tapCategoryIfVisible(cap: Cap, group: String): Boolean {
-        val terms = when (group) {
-            "GK" -> listOf("kaleciler", "kaleci", "goalkeepers", "goalkeeper")
-            "DF" -> listOf("defanslar", "defans", "defenders", "defender")
-            "MD" -> listOf("orta sahalar", "orta saha", "midfielders", "midfielder")
-            else -> listOf("forvetler", "forvet", "forwards", "forward", "attackers")
+    private fun categoryGroup(text: String): String? {
+        val value = Matcher.n(text)
+        return when {
+            value.contains("kaleci") || value.contains("goalkeeper") -> "GK"
+            value.contains("defans") || value.contains("defender") -> "DF"
+            value.contains("ortasaha") || value.contains("midfielder") -> "MD"
+            value.contains("forvet") || value.contains("forward") || value.contains("attacker") -> "FW"
+            else -> null
         }
-        val line = cap.lines.firstOrNull { ln ->
-            val text = Matcher.n(ln.text)
-            terms.any { text.contains(Matcher.n(it)) }
-        } ?: return false
-        val x = line.box.centerX().toFloat()
-        val y = line.box.centerY().toFloat()
-        return dispatchTap(x, y)
+    }
+
+    private fun tapCategoryPlus(cap: Cap, group: String): Boolean {
+        // Aynı grup için kısa kategori başlığı ile açıklama satırını ayırt et:
+        // "Kaleciler" başlıktır, "Kaleciler bölgesi için ..." ise + satırıdır.
+        val matching = cap.lines.filter { categoryGroup(it.text) == group }
+        val heading = matching.minByOrNull { Matcher.n(it.text).length } ?: return false
+        val headings = matchingCategoryHeadings(cap.lines)
+        val nextHeading = headings.filter { it.second.box.centerY() > heading.box.centerY() }
+            .minByOrNull { it.second.box.centerY() }
+        val previousHeading = headings.filter { it.second.box.centerY() < heading.box.centerY() }
+            .maxByOrNull { it.second.box.centerY() }
+
+        val description = matching.filter { it !== heading && it.box.centerY() > heading.box.centerY() }
+            .minByOrNull { it.box.centerY() - heading.box.centerY() }
+        val estimatedRowY = if (nextHeading != null) {
+            (heading.box.bottom + nextHeading.second.box.top) / 2
+        } else {
+            // Son kategori (genellikle Kaleciler) için bölüm yüksekliğini önceki
+            // başlık aralığından tahmin et; ekranın altındaki saha alanına kayma.
+            val gap = previousHeading?.let { heading.box.centerY() - it.second.box.centerY() }
+                ?: (cap.h * 0.16f).toInt()
+            heading.box.centerY() + gap / 2
+        }
+        val rowY = description?.box?.centerY() ?: estimatedRowY
+        val halfBand = max(44, (cap.h * 0.055f).toInt())
+        val top = max(0, rowY - halfBand)
+        val bottom = min(cap.h - 1, rowY + halfBand)
+
+        // Tercih edilen yöntem: ekrandaki mavi dairesel + ikonunu görüntüden bul.
+        val icon = findBluePlusCenter(cap.bitmap, top, bottom)
+        if (icon != null) return dispatchTap(icon.first, icon.second)
+
+        // WebView erişilebilirlik ağacı + düğmesine bounds veriyorsa onu kullan.
+        val root = rootInActiveWindow
+        var best: Rect? = null
+        var bestArea = Int.MAX_VALUE
+        fun walk(node: AccessibilityNodeInfo?) {
+            if (node == null) return
+            if (node.isVisibleToUser && node.isClickable) {
+                val bounds = Rect()
+                node.getBoundsInScreen(bounds)
+                val rightSide = bounds.centerX() >= cap.w * 0.82f
+                val inRow = bounds.centerY() in top..bottom
+                val sizeOk = bounds.width() in 12..150 && bounds.height() in 12..150
+                val area = bounds.width() * bounds.height()
+                if (rightSide && inRow && sizeOk && area < bestArea) {
+                    best = bounds
+                    bestArea = area
+                }
+            }
+            for (i in 0 until node.childCount) walk(node.getChild(i))
+        }
+        walk(root)
+        val b = best ?: return false
+        return dispatchTap(b.centerX().toFloat(), b.centerY().toFloat())
+    }
+
+    private fun matchingCategoryHeadings(lines: List<Ln>): List<Pair<String, Ln>> {
+        return listOf("FW", "MD", "DF", "GK").mapNotNull { group ->
+            lines.filter { categoryGroup(it.text) == group }
+                .minByOrNull { Matcher.n(it.text).length }
+                ?.let { group to it }
+        }.sortedBy { it.second.box.centerY() }
+    }
+
+    /** Mavi + simgesinin (beyaz artı merkezli) mavi çevresini bulur. */
+    private fun findBluePlusCenter(bitmap: Bitmap, top: Int, bottom: Int): Pair<Float, Float>? {
+        val left = (bitmap.width * 0.82f).toInt().coerceAtLeast(0)
+        val right = (bitmap.width * 0.985f).toInt().coerceAtMost(bitmap.width - 1)
+        val y0 = top.coerceIn(0, bitmap.height - 1)
+        val y1 = bottom.coerceIn(y0, bitmap.height - 1)
+        var count = 0
+        var sumX = 0L
+        var sumY = 0L
+        var minX = Int.MAX_VALUE
+        var maxX = Int.MIN_VALUE
+        var minY = Int.MAX_VALUE
+        var maxY = Int.MIN_VALUE
+        for (y in y0..y1 step 2) {
+            for (x in left..right step 2) {
+                val color = bitmap.getPixel(x, y)
+                val r = (color shr 16) and 0xff
+                val g = (color shr 8) and 0xff
+                val b = color and 0xff
+                if (b > 170 && g > 95 && b > g * 1.05f && g > r * 1.4f && b > r * 1.6f) {
+                    count++
+                    sumX += x
+                    sumY += y
+                    minX = min(minX, x); maxX = max(maxX, x)
+                    minY = min(minY, y); maxY = max(maxY, y)
+                }
+            }
+        }
+        val width = maxX - minX
+        val height = maxY - minY
+        if (count < 18 || width !in 12..90 || height !in 12..90) return null
+        return (sumX.toFloat() / count) to (sumY.toFloat() / count)
     }
 
     private suspend fun stepInList(p: AutoPlayer): Boolean {
